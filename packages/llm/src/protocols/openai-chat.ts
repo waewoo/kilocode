@@ -72,7 +72,7 @@ const OpenAIChatMessage = Schema.Union([
   }),
   Schema.Struct({
     role: Schema.Literal("assistant"),
-    content: Schema.NullOr(Schema.String),
+    content: Schema.String,
     tool_calls: optionalArray(OpenAIChatAssistantToolCall),
     reasoning_content: Schema.optional(Schema.String),
   }),
@@ -252,7 +252,7 @@ const lowerAssistantMessage = Effect.fn("OpenAIChat.lowerAssistantMessage")(func
   }
   return {
     role: "assistant" as const,
-    content: content.length === 0 ? null : ProviderShared.joinText(content),
+    content: content.length === 0 ? "" : ProviderShared.joinText(content),
     tool_calls: toolCalls.length === 0 ? undefined : toolCalls,
     reasoning_content:
       reasoning.length > 0
