@@ -3,6 +3,11 @@ name: Build and release local VSIX
 on:
   workflow_dispatch:
     inputs:
+      build_ref:
+        description: "Branch, tag, or commit to build"
+        required: true
+        default: "release/v7.4.22-null-content-fix"
+        type: string
       release_tag:
         description: "Release tag to create (for example v7.4.22-null-content-fix)"
         required: true
@@ -10,7 +15,7 @@ on:
       prerelease:
         description: "Mark the GitHub release as a pre-release"
         required: true
-        default: true
+        default: false
         type: boolean
 
 permissions:
@@ -22,8 +27,18 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - name: Checkout selected branch
+      - name: Checkout requested build ref
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.build_ref }}
+
+      - name: Show selected source revision
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "Requested build ref: ${{ inputs.build_ref }}"
+          echo "Resolved commit: $(git rev-parse HEAD)"
+          git log -1 --oneline
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -130,7 +145,7 @@ jobs:
           path: packages/kilo-vscode/out/*.vsix
           if-no-files-found: error
 
-      - name: Create GitHub release
+      - name: Create or update GitHub release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.release_tag }}
