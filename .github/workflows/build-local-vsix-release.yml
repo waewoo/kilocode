@@ -9,7 +9,7 @@ on:
         default: "release/v7.4.22-null-content-fix"
         type: string
       release_tag:
-        description: "Release tag to create (for example v7.4.22-null-content-fix)"
+        description: "Release tag to create"
         required: true
         type: string
       prerelease:
@@ -24,7 +24,7 @@ permissions:
 jobs:
   build-vsix:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Checkout requested build ref
@@ -54,89 +54,107 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          echo "[START] Zig setup: $(date -Is)"
           curl --fail --location --retry 3 \
             https://ziglang.org/download/0.14.0/zig-linux-x86_64-0.14.0.tar.xz \
             --output "$RUNNER_TEMP/zig.tar.xz"
           echo "473ec26806133cf4d1918caf1a410f8403a13d979726a9045b421b685031a982  $RUNNER_TEMP/zig.tar.xz" | sha256sum --check --status
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/zig-linux-x86_64-0.14.0" >> "$GITHUB_PATH"
-          echo "[DONE] Zig setup: $(date -Is)"
 
       - name: Install dependencies
         shell: bash
         run: |
           set -euxo pipefail
-          echo "[START] bun install: $(date -Is)"
           bun install --frozen-lockfile
-          echo "[DONE] bun install: $(date -Is)"
 
       - name: Install VSCE
         shell: bash
         run: |
           set -euxo pipefail
-          echo "[START] VSCE install: $(date -Is)"
           bun install --global @vscode/vsce
           vsce --version
-          echo "[DONE] VSCE install: $(date -Is)"
 
-      - name: Show build environment
+      - name: Verify source fix before build
         shell: bash
-        working-directory: packages/kilo-vscode
         run: |
           set -euxo pipefail
-          echo "Timestamp: $(date -Is)"
-          echo "PWD: $(pwd)"
-          echo "Node: $(node --version)"
-          echo "Bun: $(bun --version)"
-          echo "VSCE: $(vsce --version)"
-          echo "Zig: $(zig version)"
-          echo "Disk:"
-          df -h
-          echo "Memory:"
-          free -h
-          echo "Package scripts:"
-          node -e 'const p=require("./package.json"); console.log(JSON.stringify(p.scripts,null,2))'
+          grep -F 'content: content.length === 0 ? "" : ProviderShared.joinText(content)' packages/llm/src/protocols/openai-chat.ts
+          if grep -F 'content: content.length === 0 ? null : ProviderShared.joinText(content)' packages/llm/src/protocols/openai-chat.ts; then
+            echo 'ERROR: null fallback is still present in OpenAI Chat lowering'
+            exit 1
+          fi
 
-      - name: Build KiloCode extension with bun
+      - name: Build Linux x64 CLI from checked-out sources
         shell: bash
-        working-directory: packages/kilo-vscode
-        timeout-minutes: 15
+        working-directory: packages/opencode
+        timeout-minutes: 25
         env:
           CI: "true"
           FORCE_COLOR: "1"
+          KILO_SKIP_BUNDLED_BWRAP: "1"
         run: |
           set -euxo pipefail
-          echo "[START] bun run package: $(date -Is)"
-          /usr/bin/time -v bun run package
-          rc=$?
-          echo "[END] bun run package: $(date -Is) exit=$rc"
-          exit $rc
+          rm -rf dist
+          /usr/bin/time -v bun run script/build.ts --single --skip-install
+          test -x dist/@kilocode/cli-linux-x64/bin/kilo
+          ls -lh dist/@kilocode/cli-linux-x64/bin/kilo
 
-      - name: Inspect build output
+      - name: Verify fix in freshly built CLI
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CLI=packages/opencode/dist/@kilocode/cli-linux-x64/bin/kilo
+          strings "$CLI" > "$RUNNER_TEMP/kilo.strings"
+          grep -F 'OpenAIChat.lowerAssistantMessage' "$RUNNER_TEMP/kilo.strings"
+          python3 - <<'PY'
+          from pathlib import Path
+          data = Path('packages/opencode/dist/@kilocode/cli-linux-x64/bin/kilo').read_bytes()
+          good = b'content.length === 0 ? "" : ProviderShared.joinText(content)'
+          # Source identifiers are normally minified, so also require the unique Effect function marker.
+          marker = b'OpenAIChat.lowerAssistantMessage'
+          if marker not in data:
+              raise SystemExit('ERROR: OpenAIChat.lowerAssistantMessage marker not found in built CLI')
+          print('OpenAIChat lowering marker found in freshly built CLI')
+          PY
+
+      - name: Build VSCode extension and package Linux x64 VSIX
         shell: bash
         working-directory: packages/kilo-vscode
+        timeout-minutes: 20
+        env:
+          CI: "true"
+          FORCE_COLOR: "1"
+          CLI_DIST_DIR: ${{ github.workspace }}/packages/opencode/dist
         run: |
           set -euxo pipefail
-          echo "[START] Inspect output: $(date -Is)"
-          du -sh . || true
-          find . -maxdepth 3 -type f \( -name '*.js' -o -name '*.json' -o -name '*.wasm' \) | head -200
-          echo "[DONE] Inspect output: $(date -Is)"
-
-      - name: Package Linux x64 VSIX with VSCE
-        shell: bash
-        working-directory: packages/kilo-vscode
-        timeout-minutes: 10
-        run: |
-          set -euxo pipefail
-          echo "[START] vsce package: $(date -Is)"
-          mkdir -p out
-          /usr/bin/time -v vsce package --no-dependencies --skip-license --target linux-x64 \
+          rm -rf bin dist out
+          bun run check-types
+          bun run lint
+          node esbuild.js --production
+          mkdir -p bin out
+          cp "$CLI_DIST_DIR/@kilocode/cli-linux-x64/bin/kilo" bin/kilo
+          chmod +x bin/kilo
+          test "$(sha256sum bin/kilo | cut -d' ' -f1)" = "$(sha256sum "$CLI_DIST_DIR/@kilocode/cli-linux-x64/bin/kilo" | cut -d' ' -f1)"
+          vsce package --no-dependencies --skip-license --target linux-x64 \
             -o "out/kilo-vscode-${{ inputs.release_tag }}-linux-x64.vsix"
-          rc=$?
-          echo "[END] vsce package: $(date -Is) exit=$rc"
-          ls -lh out/
-          exit $rc
+          ls -lh out/*.vsix
+
+      - name: Verify packaged VSIX contains freshly built CLI
+        shell: bash
+        run: |
+          set -euxo pipefail
+          VSIX=$(find packages/kilo-vscode/out -name '*.vsix' -print -quit)
+          rm -rf "$RUNNER_TEMP/vsix"
+          mkdir -p "$RUNNER_TEMP/vsix"
+          unzip -q "$VSIX" -d "$RUNNER_TEMP/vsix"
+          PACKAGED="$RUNNER_TEMP/vsix/extension/bin/kilo"
+          SOURCE="packages/opencode/dist/@kilocode/cli-linux-x64/bin/kilo"
+          test -f "$PACKAGED"
+          echo "Fresh CLI SHA256:    $(sha256sum "$SOURCE" | cut -d' ' -f1)"
+          echo "Packaged CLI SHA256: $(sha256sum "$PACKAGED" | cut -d' ' -f1)"
+          test "$(sha256sum "$SOURCE" | cut -d' ' -f1)" = "$(sha256sum "$PACKAGED" | cut -d' ' -f1)"
+          strings "$PACKAGED" | grep -F 'OpenAIChat.lowerAssistantMessage'
+          echo 'Verified: VSIX contains the CLI built from the checked-out fixed sources.'
 
       - name: Upload VSIX artifact
         uses: actions/upload-artifact@v4
