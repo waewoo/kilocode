@@ -4,6 +4,30 @@ function record(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value)
 }
 
+type RequestBody = Record<string, unknown>
+type RequestTransform = (body: RequestBody) => RequestBody
+
+const isRequestTransform = (value: unknown): value is RequestTransform => typeof value === "function"
+
+export function patchOpenAICompatibleOptions(npm: string, options: Record<string, unknown>) {
+  if (!npm.includes("@ai-sdk/openai-compatible")) return
+  const previous = isRequestTransform(options.transformRequestBody) ? options.transformRequestBody : undefined
+  options.transformRequestBody = (body: RequestBody) => {
+    const transformed = previous?.(body) ?? body
+    if (!Array.isArray(transformed.messages)) return transformed
+    return {
+      ...transformed,
+      messages: transformed.messages.map((message) => {
+        if (!record(message)) return message
+        if (message.role !== "assistant") return message
+        if (message.content !== null) return message
+        if (!Array.isArray(message.tool_calls) || message.tool_calls.length === 0) return message
+        return { ...message, content: "" }
+      }),
+    }
+  }
+}
+
 export function bedrockAuth(auth: Auth.Info | undefined) {
   if (auth?.type !== "api" || auth.metadata?.authType !== "accessKey") return
   const secret = auth.metadata.secretAccessKey
@@ -57,6 +81,8 @@ export function providerKey(providerID: string, auth: Auth.Info) {
 const VERTEX_CREDENTIALS = "kiloVertexCredentials"
 
 export function vertexOptions(providerID: string, npm: string, options: Record<string, unknown>) {
+  patchOpenAICompatibleOptions(npm, options)
+
   const getter = options[VERTEX_CREDENTIALS]
   delete options[VERTEX_CREDENTIALS]
   if (providerID !== "google-vertex" || npm.includes("@ai-sdk/openai-compatible")) return
