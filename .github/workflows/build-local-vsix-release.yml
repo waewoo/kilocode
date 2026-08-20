@@ -109,52 +109,59 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           data = Path('packages/opencode/dist/@kilocode/cli-linux-x64/bin/kilo').read_bytes()
-          good = b'content.length === 0 ? "" : ProviderShared.joinText(content)'
-          # Source identifiers are normally minified, so also require the unique Effect function marker.
           marker = b'OpenAIChat.lowerAssistantMessage'
           if marker not in data:
               raise SystemExit('ERROR: OpenAIChat.lowerAssistantMessage marker not found in built CLI')
           print('OpenAIChat lowering marker found in freshly built CLI')
           PY
 
-      - name: Build VSCode extension and package Linux x64 VSIX
+      - name: Build complete Linux x64 VSIX with official packaging script
         shell: bash
         working-directory: packages/kilo-vscode
-        timeout-minutes: 20
+        timeout-minutes: 25
         env:
           CI: "true"
           FORCE_COLOR: "1"
           CLI_DIST_DIR: ${{ github.workspace }}/packages/opencode/dist
+          KILO_VSIX_TARGET: linux-x64
         run: |
           set -euxo pipefail
-          rm -rf bin dist out
-          bun run check-types
-          bun run lint
-          node esbuild.js --production
-          mkdir -p bin out
-          cp "$CLI_DIST_DIR/@kilocode/cli-linux-x64/bin/kilo" bin/kilo
-          chmod +x bin/kilo
-          test "$(sha256sum bin/kilo | cut -d' ' -f1)" = "$(sha256sum "$CLI_DIST_DIR/@kilocode/cli-linux-x64/bin/kilo" | cut -d' ' -f1)"
-          vsce package --no-dependencies --skip-license --target linux-x64 \
-            -o "out/kilo-vscode-${{ inputs.release_tag }}-linux-x64.vsix"
-          ls -lh out/*.vsix
+          /usr/bin/time -v bun run script/build.ts
+          test -f out/kilo-vscode-linux-x64.vsix
+          ls -lh out/kilo-vscode-linux-x64.vsix
 
-      - name: Verify packaged VSIX contains freshly built CLI
+      - name: Verify packaged VSIX is complete and contains fixed CLI
         shell: bash
         run: |
           set -euxo pipefail
-          VSIX=$(find packages/kilo-vscode/out -name '*.vsix' -print -quit)
+          VSIX=packages/kilo-vscode/out/kilo-vscode-linux-x64.vsix
           rm -rf "$RUNNER_TEMP/vsix"
           mkdir -p "$RUNNER_TEMP/vsix"
           unzip -q "$VSIX" -d "$RUNNER_TEMP/vsix"
-          PACKAGED="$RUNNER_TEMP/vsix/extension/bin/kilo"
+          BIN="$RUNNER_TEMP/vsix/extension/bin"
+          PACKAGED="$BIN/kilo"
           SOURCE="packages/opencode/dist/@kilocode/cli-linux-x64/bin/kilo"
+
           test -f "$PACKAGED"
+          test -f "$BIN/ffmpeg"
+          test -f "$BIN/bwrap"
+          test -n "$(find "$BIN" -type f -name '*.wasm' -print -quit)"
+          test -n "$(find "$BIN" -type f -name 'kilo-sandbox-*' -print -quit)"
+
           echo "Fresh CLI SHA256:    $(sha256sum "$SOURCE" | cut -d' ' -f1)"
           echo "Packaged CLI SHA256: $(sha256sum "$PACKAGED" | cut -d' ' -f1)"
           test "$(sha256sum "$SOURCE" | cut -d' ' -f1)" = "$(sha256sum "$PACKAGED" | cut -d' ' -f1)"
           strings "$PACKAGED" | grep -F 'OpenAIChat.lowerAssistantMessage'
-          echo 'Verified: VSIX contains the CLI built from the checked-out fixed sources.'
+          echo "Files under extension/bin: $(find "$BIN" -type f | wc -l)"
+          du -sh "$BIN"
+          echo 'Verified: complete runtime resources + freshly built fixed CLI are packaged.'
+
+      - name: Rename VSIX for release
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mv packages/kilo-vscode/out/kilo-vscode-linux-x64.vsix \
+            "packages/kilo-vscode/out/kilo-vscode-${{ inputs.release_tag }}-linux-x64.vsix"
 
       - name: Upload VSIX artifact
         uses: actions/upload-artifact@v4
