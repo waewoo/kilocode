@@ -29,7 +29,7 @@ if (!existsSync(cliDistDir)) {
   throw new Error(`CLI dist directory not found: ${cliDistDir}`)
 }
 
-const targets = [
+const allTargets = [
   { target: "linux-x64", cliDir: "@kilocode/cli-linux-x64", binary: "kilo" },
   { target: "linux-arm64", cliDir: "@kilocode/cli-linux-arm64", binary: "kilo" },
   { target: "alpine-x64", cliDir: "@kilocode/cli-linux-x64-musl", binary: "kilo" },
@@ -39,6 +39,12 @@ const targets = [
   { target: "win32-x64", cliDir: "@kilocode/cli-windows-x64", binary: "kilo.exe" },
   { target: "win32-arm64", cliDir: "@kilocode/cli-windows-arm64", binary: "kilo.exe" },
 ]
+
+const requestedTarget = process.env.KILO_VSIX_TARGET
+const targets = requestedTarget ? allTargets.filter((config) => config.target === requestedTarget) : allTargets
+if (requestedTarget && targets.length === 0) {
+  throw new Error(`Unknown KILO_VSIX_TARGET: ${requestedTarget}`)
+}
 
 const binDir = join(import.meta.dir, "..", "bin")
 const distDir = join(import.meta.dir, "..", "dist")
@@ -104,4 +110,4 @@ for (const config of targets) {
   console.log(`  ✅ Created ${vsixPath}`)
 }
 
-console.log("\n✨ All VSIX packages built successfully!")
+console.log("\n✨ All VSIX packages built successfully!\n")
