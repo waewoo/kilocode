@@ -91,7 +91,6 @@ jobs:
         env:
           CI: "true"
           FORCE_COLOR: "1"
-          KILO_SKIP_BUNDLED_BWRAP: "1"
         run: |
           set -euxo pipefail
           rm -rf dist
