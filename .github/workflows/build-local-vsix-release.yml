@@ -74,11 +74,14 @@ jobs:
           bun install --global @vscode/vsce
           vsce --version
 
-      - name: Verify source fix before build
+      - name: Verify source fixes before build
         shell: bash
         run: |
           set -euxo pipefail
           grep -F 'content: content.length === 0 ? "" : ProviderShared.joinText(content)' packages/llm/src/protocols/openai-chat.ts
+          grep -F 'export function patchOpenAICompatibleOptions' packages/opencode/src/kilocode/provider/cloud-auth.ts
+          grep -F 'return { ...message, content: "" }' packages/opencode/src/kilocode/provider/cloud-auth.ts
+          grep -F 'patchOpenAICompatibleOptions(npm, options)' packages/opencode/src/kilocode/provider/cloud-auth.ts
           if grep -F 'content: content.length === 0 ? null : ProviderShared.joinText(content)' packages/llm/src/protocols/openai-chat.ts; then
             echo 'ERROR: null fallback is still present in OpenAI Chat lowering'
             exit 1
@@ -98,13 +101,14 @@ jobs:
           test -x dist/@kilocode/cli-linux-x64/bin/kilo
           ls -lh dist/@kilocode/cli-linux-x64/bin/kilo
 
-      - name: Verify fix in freshly built CLI
+      - name: Verify fixes in freshly built CLI
         shell: bash
         run: |
           set -euxo pipefail
           CLI=packages/opencode/dist/@kilocode/cli-linux-x64/bin/kilo
           strings "$CLI" > "$RUNNER_TEMP/kilo.strings"
           grep -F 'OpenAIChat.lowerAssistantMessage' "$RUNNER_TEMP/kilo.strings"
+          grep -F 'patchOpenAICompatibleOptions' "$RUNNER_TEMP/kilo.strings" || true
           python3 - <<'PY'
           from pathlib import Path
           data = Path('packages/opencode/dist/@kilocode/cli-linux-x64/bin/kilo').read_bytes()
