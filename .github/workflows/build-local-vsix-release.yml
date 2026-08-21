@@ -11,12 +11,12 @@ on:
       release_tag:
         description: "Release tag to create or update"
         required: true
-        default: "v7.4.22-null-content-fix.6"
+        default: "v7.4.22-null-content-fix.7"
         type: string
       package_version:
         description: "CLI/npm package version"
         required: true
-        default: "7.4.22-fix.6"
+        default: "7.4.22-fix.7"
         type: string
       prerelease:
         description: "Mark the GitHub release as a pre-release"
@@ -80,18 +80,32 @@ jobs:
           bun install --global @vscode/vsce
           vsce --version
 
-      - name: Verify source fixes before build
+      - name: Verify targeted source fix before build
         shell: bash
         run: |
           set -euxo pipefail
-          grep -F 'content: content.length === 0 ? "" : ProviderShared.joinText(content)' packages/llm/src/protocols/openai-chat.ts
-          grep -F 'export function patchOpenAICompatibleOptions' packages/opencode/src/kilocode/provider/cloud-auth.ts
-          grep -F 'return { ...message, content: "" }' packages/opencode/src/kilocode/provider/cloud-auth.ts
+          # Keep upstream OpenAI Chat semantics intact: tool-only assistant messages may be null here.
+          grep -F 'content: Schema.NullOr(Schema.String)' packages/llm/src/protocols/openai-chat.ts
+          grep -F 'content: content.length === 0 ? null : ProviderShared.joinText(content)' packages/llm/src/protocols/openai-chat.ts
+
+          # The compatibility normalization belongs only at the OpenAI-compatible provider boundary.
+          grep -F 'export function patchOpenAICompatibleOptions' packages/opencode/src/kilocode/provider/provider.ts
+          grep -F 'return { ...message, content: "" }' packages/opencode/src/kilocode/provider/provider.ts
+          grep -F 'import { patchOpenAICompatibleOptions } from "./provider"' packages/opencode/src/kilocode/provider/cloud-auth.ts
           grep -F 'patchOpenAICompatibleOptions(npm, options)' packages/opencode/src/kilocode/provider/cloud-auth.ts
-          if grep -F 'content: content.length === 0 ? null : ProviderShared.joinText(content)' packages/llm/src/protocols/openai-chat.ts; then
-            echo 'ERROR: null fallback is still present in OpenAI Chat lowering'
+
+          # Ensure the old broad workaround is gone.
+          if grep -F 'content: content.length === 0 ? "" : ProviderShared.joinText(content)' packages/llm/src/protocols/openai-chat.ts; then
+            echo 'ERROR: broad OpenAI Chat workaround is still present'
             exit 1
           fi
+
+      - name: Run targeted regression tests
+        shell: bash
+        working-directory: packages/opencode
+        run: |
+          set -euxo pipefail
+          bun test test/kilocode/provider/cloud-auth.test.ts
 
       - name: Build Linux x64 CLI once from checked-out sources
         shell: bash
@@ -108,20 +122,25 @@ jobs:
           test -x dist/@kilocode/cli-linux-x64/bin/kilo
           dist/@kilocode/cli-linux-x64/bin/kilo --version
 
-      - name: Verify fixes in freshly built CLI
+      - name: Verify targeted fix in freshly built CLI
         shell: bash
         run: |
           set -euxo pipefail
           CLI=packages/opencode/dist/@kilocode/cli-linux-x64/bin/kilo
           strings "$CLI" > "$RUNNER_TEMP/kilo.strings"
-          grep -F 'OpenAIChat.lowerAssistantMessage' "$RUNNER_TEMP/kilo.strings"
+          grep -F 'patchOpenAICompatibleOptions' "$RUNNER_TEMP/kilo.strings" || true
           python3 - <<'PY'
           from pathlib import Path
           data = Path('packages/opencode/dist/@kilocode/cli-linux-x64/bin/kilo').read_bytes()
-          marker = b'OpenAIChat.lowerAssistantMessage'
-          if marker not in data:
-              raise SystemExit('ERROR: OpenAIChat.lowerAssistantMessage marker not found in built CLI')
-          print('OpenAIChat lowering marker found in freshly built CLI')
+          markers = [
+              b'transformRequestBody',
+              b'@ai-sdk/openai-compatible',
+              b'tool_calls',
+          ]
+          missing = [m.decode() for m in markers if m not in data]
+          if missing:
+              raise SystemExit('ERROR: expected compatibility markers missing from built CLI: ' + ', '.join(missing))
+          print('OpenAI-compatible request-transform markers found in freshly built CLI')
           PY
 
       - name: Build complete Linux x64 VSIX with official packaging script
