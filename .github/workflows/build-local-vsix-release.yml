@@ -1,4 +1,4 @@
-name: Build and release local VSIX
+name: Build and release local VSIX + npm CLI
 
 on:
   workflow_dispatch:
@@ -9,8 +9,14 @@ on:
         default: "release/v7.4.22-null-content-fix"
         type: string
       release_tag:
-        description: "Release tag to create (for example v7.4.22-null-content-fix)"
+        description: "Release tag to create or update"
         required: true
+        default: "v7.4.22-null-content-fix.6"
+        type: string
+      package_version:
+        description: "CLI/npm package version"
+        required: true
+        default: "7.4.22-fix.6"
         type: string
       prerelease:
         description: "Mark the GitHub release as a pre-release"
@@ -22,9 +28,9 @@ permissions:
   contents: write
 
 jobs:
-  build-vsix:
+  build-release:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Checkout requested build ref
@@ -54,89 +60,161 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          echo "[START] Zig setup: $(date -Is)"
           curl --fail --location --retry 3 \
             https://ziglang.org/download/0.14.0/zig-linux-x86_64-0.14.0.tar.xz \
             --output "$RUNNER_TEMP/zig.tar.xz"
           echo "473ec26806133cf4d1918caf1a410f8403a13d979726a9045b421b685031a982  $RUNNER_TEMP/zig.tar.xz" | sha256sum --check --status
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/zig-linux-x86_64-0.14.0" >> "$GITHUB_PATH"
-          echo "[DONE] Zig setup: $(date -Is)"
 
       - name: Install dependencies
         shell: bash
         run: |
           set -euxo pipefail
-          echo "[START] bun install: $(date -Is)"
           bun install --frozen-lockfile
-          echo "[DONE] bun install: $(date -Is)"
 
       - name: Install VSCE
         shell: bash
         run: |
           set -euxo pipefail
-          echo "[START] VSCE install: $(date -Is)"
           bun install --global @vscode/vsce
           vsce --version
-          echo "[DONE] VSCE install: $(date -Is)"
 
-      - name: Show build environment
+      - name: Verify source fixes before build
         shell: bash
-        working-directory: packages/kilo-vscode
         run: |
           set -euxo pipefail
-          echo "Timestamp: $(date -Is)"
-          echo "PWD: $(pwd)"
-          echo "Node: $(node --version)"
-          echo "Bun: $(bun --version)"
-          echo "VSCE: $(vsce --version)"
-          echo "Zig: $(zig version)"
-          echo "Disk:"
-          df -h
-          echo "Memory:"
-          free -h
-          echo "Package scripts:"
-          node -e 'const p=require("./package.json"); console.log(JSON.stringify(p.scripts,null,2))'
+          grep -F 'content: content.length === 0 ? "" : ProviderShared.joinText(content)' packages/llm/src/protocols/openai-chat.ts
+          grep -F 'export function patchOpenAICompatibleOptions' packages/opencode/src/kilocode/provider/cloud-auth.ts
+          grep -F 'return { ...message, content: "" }' packages/opencode/src/kilocode/provider/cloud-auth.ts
+          grep -F 'patchOpenAICompatibleOptions(npm, options)' packages/opencode/src/kilocode/provider/cloud-auth.ts
+          if grep -F 'content: content.length === 0 ? null : ProviderShared.joinText(content)' packages/llm/src/protocols/openai-chat.ts; then
+            echo 'ERROR: null fallback is still present in OpenAI Chat lowering'
+            exit 1
+          fi
 
-      - name: Build KiloCode extension with bun
+      - name: Build Linux x64 CLI once from checked-out sources
         shell: bash
-        working-directory: packages/kilo-vscode
-        timeout-minutes: 15
+        working-directory: packages/opencode
+        timeout-minutes: 30
         env:
           CI: "true"
           FORCE_COLOR: "1"
+          KILO_VERSION: ${{ inputs.package_version }}
         run: |
           set -euxo pipefail
-          echo "[START] bun run package: $(date -Is)"
-          /usr/bin/time -v bun run package
-          rc=$?
-          echo "[END] bun run package: $(date -Is) exit=$rc"
-          exit $rc
+          rm -rf dist
+          /usr/bin/time -v bun run script/build.ts --single --skip-install
+          test -x dist/@kilocode/cli-linux-x64/bin/kilo
+          dist/@kilocode/cli-linux-x64/bin/kilo --version
 
-      - name: Inspect build output
+      - name: Verify fixes in freshly built CLI
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CLI=packages/opencode/dist/@kilocode/cli-linux-x64/bin/kilo
+          strings "$CLI" > "$RUNNER_TEMP/kilo.strings"
+          grep -F 'OpenAIChat.lowerAssistantMessage' "$RUNNER_TEMP/kilo.strings"
+          python3 - <<'PY'
+          from pathlib import Path
+          data = Path('packages/opencode/dist/@kilocode/cli-linux-x64/bin/kilo').read_bytes()
+          marker = b'OpenAIChat.lowerAssistantMessage'
+          if marker not in data:
+              raise SystemExit('ERROR: OpenAIChat.lowerAssistantMessage marker not found in built CLI')
+          print('OpenAIChat lowering marker found in freshly built CLI')
+          PY
+
+      - name: Build complete Linux x64 VSIX with official packaging script
         shell: bash
         working-directory: packages/kilo-vscode
+        timeout-minutes: 25
+        env:
+          CI: "true"
+          FORCE_COLOR: "1"
+          CLI_DIST_DIR: ${{ github.workspace }}/packages/opencode/dist
+          KILO_VSIX_TARGET: linux-x64
         run: |
           set -euxo pipefail
-          echo "[START] Inspect output: $(date -Is)"
-          du -sh . || true
-          find . -maxdepth 3 -type f \( -name '*.js' -o -name '*.json' -o -name '*.wasm' \) | head -200
-          echo "[DONE] Inspect output: $(date -Is)"
+          /usr/bin/time -v bun run script/build.ts
+          test -f out/kilo-vscode-linux-x64.vsix
+          ls -lh out/kilo-vscode-linux-x64.vsix
 
-      - name: Package Linux x64 VSIX with VSCE
+      - name: Verify packaged VSIX uses the freshly built CLI
         shell: bash
-        working-directory: packages/kilo-vscode
-        timeout-minutes: 10
         run: |
           set -euxo pipefail
-          echo "[START] vsce package: $(date -Is)"
-          mkdir -p out
-          /usr/bin/time -v vsce package --no-dependencies --skip-license --target linux-x64 \
-            -o "out/kilo-vscode-${{ inputs.release_tag }}-linux-x64.vsix"
-          rc=$?
-          echo "[END] vsce package: $(date -Is) exit=$rc"
-          ls -lh out/
-          exit $rc
+          VSIX=packages/kilo-vscode/out/kilo-vscode-linux-x64.vsix
+          rm -rf "$RUNNER_TEMP/vsix"
+          mkdir -p "$RUNNER_TEMP/vsix"
+          unzip -q "$VSIX" -d "$RUNNER_TEMP/vsix"
+          BIN="$RUNNER_TEMP/vsix/extension/bin"
+          PACKAGED="$BIN/kilo"
+          SOURCE="packages/opencode/dist/@kilocode/cli-linux-x64/bin/kilo"
+          test -f "$PACKAGED"
+          test -f "$BIN/ffmpeg"
+          test -f "$BIN/bwrap"
+          test -n "$(find "$BIN" -type f -name '*.wasm' -print -quit)"
+          test -n "$(find "$BIN" -type f -name 'kilo-sandbox-*' -print -quit)"
+          echo "Fresh CLI SHA256:    $(sha256sum "$SOURCE" | cut -d' ' -f1)"
+          echo "Packaged CLI SHA256: $(sha256sum "$PACKAGED" | cut -d' ' -f1)"
+          test "$(sha256sum "$SOURCE" | cut -d' ' -f1)" = "$(sha256sum "$PACKAGED" | cut -d' ' -f1)"
+
+      - name: Rename VSIX for release
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mv packages/kilo-vscode/out/kilo-vscode-linux-x64.vsix \
+            "packages/kilo-vscode/out/kilo-vscode-${{ inputs.release_tag }}-linux-x64.vsix"
+
+      - name: Assemble standalone npm package from the same CLI
+        shell: bash
+        env:
+          PACKAGE_VERSION: ${{ inputs.package_version }}
+        run: |
+          set -euxo pipefail
+          SRC=packages/opencode/dist/@kilocode/cli-linux-x64/bin
+          PKG="$RUNNER_TEMP/npm-package"
+          rm -rf "$PKG"
+          mkdir -p "$PKG/bin"
+          cp packages/opencode/bin/kilo "$PKG/bin/kilo"
+          cp "$SRC/kilo" "$PKG/bin/.kilo"
+          chmod 755 "$PKG/bin/kilo" "$PKG/bin/.kilo"
+          for entry in tree-sitter console licenses bwrap kilo-sandbox-mutation-worker.js kilo-sandbox-network-relay kilo-sandbox-seccomp; do
+            if [ -e "$SRC/$entry" ]; then cp -a "$SRC/$entry" "$PKG/bin/"; fi
+          done
+          cp LICENSE "$PKG/LICENSE"
+          cp packages/opencode/README.md "$PKG/README.md"
+          node - <<'NODE'
+          const fs = require('fs')
+          const path = process.env.RUNNER_TEMP + '/npm-package/package.json'
+          const pkg = {
+            name: '@waewoo/kilocode-cli',
+            version: process.env.PACKAGE_VERSION,
+            description: 'Kilo Code CLI Linux x64 build with OpenAI-compatible null tool-call content fix',
+            license: 'MIT',
+            private: false,
+            os: ['linux'],
+            cpu: ['x64'],
+            bin: { kilo: './bin/kilo', kilocode: './bin/kilo' },
+            repository: { type: 'git', url: 'https://github.com/waewoo/kilocode' }
+          }
+          fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n')
+          NODE
+          cd "$PKG"
+          npm pack --pack-destination "$RUNNER_TEMP"
+
+      - name: Smoke-test npm tarball
+        shell: bash
+        run: |
+          set -euxo pipefail
+          TGZ=$(find "$RUNNER_TEMP" -maxdepth 1 -name 'waewoo-kilocode-cli-*.tgz' -print -quit)
+          test -n "$TGZ"
+          PREFIX="$RUNNER_TEMP/npm-global"
+          npm install -g --prefix "$PREFIX" "$TGZ"
+          "$PREFIX/bin/kilo" --version
+          test -x "$PREFIX/lib/node_modules/@waewoo/kilocode-cli/bin/.kilo"
+          test -n "$(find "$PREFIX/lib/node_modules/@waewoo/kilocode-cli/bin" -name '*.wasm' -print -quit)"
+          sha256sum "$TGZ"
 
       - name: Upload VSIX artifact
         uses: actions/upload-artifact@v4
@@ -145,11 +223,21 @@ jobs:
           path: packages/kilo-vscode/out/*.vsix
           if-no-files-found: error
 
-      - name: Create or update GitHub release
+      - name: Upload npm package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kilocode-cli-npm-${{ inputs.package_version }}-linux-x64
+          path: ${{ runner.temp }}/waewoo-kilocode-cli-*.tgz
+          if-no-files-found: error
+
+      - name: Create or update GitHub release with both assets
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.release_tag }}
           name: KiloCode ${{ inputs.release_tag }}
           prerelease: ${{ inputs.prerelease }}
           generate_release_notes: true
-          files: packages/kilo-vscode/out/*.vsix
+          files: |
+            packages/kilo-vscode/out/*.vsix
+            ${{ runner.temp }}/waewoo-kilocode-cli-*.tgz
+          fail_on_unmatched_files: true
