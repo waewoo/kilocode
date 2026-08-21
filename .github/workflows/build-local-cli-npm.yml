@@ -13,9 +13,14 @@ on:
         required: true
         default: "7.4.22-fix.6"
         type: string
+      release_tag:
+        description: "Existing GitHub release tag to attach the npm package to"
+        required: true
+        default: "v7.4.22-null-content-fix.6"
+        type: string
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build-cli-npm:
@@ -135,3 +140,10 @@ jobs:
           name: kilocode-cli-npm-${{ inputs.package_version }}-linux-x64
           path: ${{ runner.temp }}/waewoo-kilocode-cli-*.tgz
           if-no-files-found: error
+
+      - name: Attach npm package to GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          files: ${{ runner.temp }}/waewoo-kilocode-cli-*.tgz
+          fail_on_unmatched_files: true
