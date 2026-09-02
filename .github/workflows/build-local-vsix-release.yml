@@ -6,17 +6,17 @@ on:
       build_ref:
         description: "Branch, tag, or commit to build"
         required: true
-        default: "release/v7.4.22-null-content-fix"
+        default: "release/v7.5.6-null-content-fix"
         type: string
       release_tag:
         description: "Release tag to create or update"
         required: true
-        default: "v7.4.22-null-content-fix.7"
+        default: "v7.5.6-null-content-fix.1"
         type: string
       package_version:
         description: "CLI/npm package version"
         required: true
-        default: "7.4.22-fix.7"
+        default: "7.5.6-fix.1"
         type: string
       prerelease:
         description: "Mark the GitHub release as a pre-release"
