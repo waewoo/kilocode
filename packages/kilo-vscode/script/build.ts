@@ -29,7 +29,7 @@ if (!existsSync(cliDistDir)) {
   throw new Error(`CLI dist directory not found: ${cliDistDir}`)
 }
 
-const targets = [
+const allTargets = [
   { target: "linux-x64", cliDir: "@kilocode/cli-linux-x64", binary: "kilo" },
   { target: "linux-arm64", cliDir: "@kilocode/cli-linux-arm64", binary: "kilo" },
   { target: "alpine-x64", cliDir: "@kilocode/cli-linux-x64-musl", binary: "kilo" },
