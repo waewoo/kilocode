@@ -40,6 +40,12 @@ const allTargets = [
   { target: "win32-arm64", cliDir: "@kilocode/cli-windows-arm64", binary: "kilo.exe" },
 ]
 
+const requestedTarget = process.env.KILO_VSIX_TARGET
+const targets = requestedTarget ? allTargets.filter((config) => config.target === requestedTarget) : allTargets
+if (requestedTarget && targets.length === 0) {
+  throw new Error(`Unknown KILO_VSIX_TARGET: ${requestedTarget}`)
+}
+
 const binDir = join(import.meta.dir, "..", "bin")
 const distDir = join(import.meta.dir, "..", "dist")
 const outDir = join(import.meta.dir, "..", "out")
