@@ -69,6 +69,8 @@ export interface GlobInput {
   readonly follow?: boolean
   readonly signal?: AbortSignal
   readonly validate?: Effect.Effect<void, unknown> // kilocode_change - bind approved searches at spawn
+  readonly noRequireGit?: boolean // kilocode_change - honor ignore files outside a git repository
+  readonly exclude?: readonly string[] // kilocode_change - additional exclusion globs
 }
 
 export interface GrepInput extends KiloGrep.Options {
@@ -93,6 +95,7 @@ export interface SearchResult<A> {
   readonly items: readonly A[]
   readonly truncated: boolean
   readonly partial: boolean
+  readonly invalidPattern?: boolean // kilocode_change - distinguish malformed globs from transient errors
 }
 // kilocode_change end
 
@@ -100,8 +103,12 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/v2
 
 const failure = (message: string, cause?: unknown) => new Error({ message, cause })
 
+// kilocode_change start - also classify invalid globs for the marketplace scan
 const isInvalidPattern = (stderr: string) =>
-  stderr.includes("regex parse error") || stderr.includes("error parsing regex")
+  stderr.includes("regex parse error") ||
+  stderr.includes("error parsing regex") ||
+  stderr.includes("error parsing glob")
+// kilocode_change end
 
 const layer = Layer.effect(
   Service,
@@ -114,6 +121,7 @@ const layer = Layer.effect(
       readonly args: string[]
       readonly limit: number
       readonly signal?: AbortSignal
+      readonly timeout?: number // kilocode_change
       readonly parse: (line: string) => Effect.Effect<A | undefined, Error>
       readonly pattern?: string
       readonly onItem?: (item: A) => Effect.Effect<void>
@@ -128,50 +136,63 @@ const layer = Layer.effect(
             cwd: input.cwd,
             extendEnv: true,
             stdin: "ignore",
-            forceKillAfter: input.stop ? Duration.seconds(1) : undefined, // kilocode_change - bound grep interruption
+            forceKillAfter: input.stop || input.timeout != null ? Duration.seconds(1) : undefined, // kilocode_change - bound search interruption
           })
           const validated = input.validate ? SpawnValidation.attach(command, input.validate) : command
-          const spawned = input.stop ? SpawnExit.attach(validated) : validated // kilocode_change
+          const spawned = input.stop || input.timeout != null ? SpawnExit.attach(validated) : validated // kilocode_change
           const handle = yield* process.spawn(spawned)
-          // kilocode_change end
-          const stderrFiber = yield* collectStream(handle.stderr, ERROR_BYTES).pipe(
-            Effect.map((output) => output.buffer.toString("utf8")),
-            Effect.forkScoped,
-          )
-          let observed = 0
-          let stopped = false // kilocode_change
-          const take = input.stop // kilocode_change start
-            ? Stream.takeUntil<A>((row) => {
-                stopped = input.stop?.(row) ?? false
-                return stopped
-              })
-            : Stream.take(input.limit + 1) // kilocode_change end
-          const rows = yield* Stream.decodeText(handle.stdout).pipe(
-            Stream.splitLines,
-            Stream.filter((line) => line.length > 0),
-            Stream.mapEffect(input.parse),
-            Stream.filter((row): row is A => row !== undefined),
-            Stream.tap((row) => {
-              if (!input.onItem || observed++ >= input.limit) return Effect.void
-              return input.onItem(row)
-            }),
-            take, // kilocode_change
-            Stream.runCollect,
-            Effect.map((chunk) => [...chunk]),
-          )
-          if (stopped) return { items: rows, truncated: true, partial: false } // kilocode_change
-          const truncated = input.stop ? false : rows.length > input.limit // kilocode_change - custom stop owns truncation
-          if (truncated) return { items: rows.slice(0, input.limit), truncated, partial: false }
+          const search = Effect.gen(function* () {
+            // kilocode_change end
+            const stderrFiber = yield* collectStream(handle.stderr, ERROR_BYTES).pipe(
+              Effect.map((output) => output.buffer.toString("utf8")),
+              Effect.forkScoped,
+            )
+            let observed = 0
+            let stopped = false // kilocode_change
+            const take = input.stop // kilocode_change start
+              ? Stream.takeUntil<A>((row) => {
+                  stopped = input.stop?.(row) ?? false
+                  return stopped
+                })
+              : Stream.take(input.limit + 1) // kilocode_change end
+            const rows = yield* Stream.decodeText(handle.stdout).pipe(
+              Stream.splitLines,
+              Stream.filter((line) => line.length > 0),
+              Stream.mapEffect(input.parse),
+              Stream.filter((row): row is A => row !== undefined),
+              Stream.tap((row) => {
+                if (!input.onItem || observed++ >= input.limit) return Effect.void
+                return input.onItem(row)
+              }),
+              take, // kilocode_change
+              Stream.runCollect,
+              Effect.map((chunk) => [...chunk]),
+            )
+            if (stopped) return { items: rows, truncated: true, partial: false } // kilocode_change
+            const truncated = input.stop ? false : rows.length > input.limit // kilocode_change - custom stop owns truncation
+            if (truncated) return { items: rows.slice(0, input.limit), truncated, partial: false }
 
-          const code = yield* handle.exitCode
-          const stderr = yield* Fiber.join(stderrFiber)
-          if (input.pattern && code === 2 && isInvalidPattern(stderr)) {
-            return yield* new InvalidPatternError({ pattern: input.pattern, message: stderr.trim() })
-          }
-          if (code !== 0 && code !== 1 && code !== 2) {
-            return yield* failure(stderr.trim() || `ripgrep failed with code ${code}`)
-          }
-          return { items: code === 1 ? [] : rows, truncated: false, partial: code === 2 }
+            const code = yield* handle.exitCode
+            const stderr = yield* Fiber.join(stderrFiber)
+            if (input.pattern && code === 2 && isInvalidPattern(stderr)) {
+              return yield* new InvalidPatternError({ pattern: input.pattern, message: stderr.trim() })
+            }
+            if (code !== 0 && code !== 1 && code !== 2) {
+              return yield* failure(stderr.trim() || `ripgrep failed with code ${code}`)
+            }
+            return { items: code === 1 ? [] : rows, truncated: false, partial: code === 2 }
+            // kilocode_change start
+          })
+          return yield* input.timeout == null
+            ? search
+            : search.pipe(
+                Effect.timeoutOrElse({
+                  duration: input.timeout,
+                  orElse: () =>
+                    Effect.fail(failure("Glob search timed out after 2 minutes. Narrow the search path or pattern.")),
+                }),
+              )
+          // kilocode_change end
         }),
       )
       const abortable = input.signal ? program.pipe(Effect.raceFirst(waitForAbort(input.signal))) : program
@@ -192,13 +213,17 @@ const layer = Layer.effect(
           cwd: input.cwd,
           limit: input.limit,
           signal: input.signal,
+          pattern: input.pattern, // kilocode_change - surface malformed globs instead of a bare partial result
+          timeout: 2 * 60 * 1000, // kilocode_change
           validate: input.validate, // kilocode_change - preserve spawn-bound target validation
           args: [
             "--no-config",
             "--files",
             ...(input.hidden ? ["--hidden"] : []),
             ...(input.follow ? ["--follow"] : []),
+            ...(input.noRequireGit ? ["--no-require-git"] : []), // kilocode_change
             `--glob=${input.pattern}`,
+            ...(input.exclude ?? []).map((glob) => `--glob=!${glob}`), // kilocode_change
             "--glob=!**/.git/**",
             ".",
           ],
@@ -221,7 +246,11 @@ const layer = Layer.effect(
             ),
           })),
           // kilocode_change end
-          Effect.catchTag("Ripgrep.InvalidPatternError", (cause) => Effect.fail(failure(cause.message, cause))),
+          // kilocode_change start - a malformed glob narrows the result, not the whole request
+          Effect.catchTag("Ripgrep.InvalidPatternError", () =>
+            Effect.succeed({ items: [], truncated: false, partial: true, invalidPattern: true }),
+          ),
+          // kilocode_change end
         ),
       find: (input) =>
         run<Entry>({
@@ -313,7 +342,10 @@ const layer = Layer.effect(
                 }),
                 line: match.line_number,
                 offset: match.absolute_offset,
-                text: match.lines.text.length > 2_000 ? match.lines.text.slice(0, 2_000) + "..." : match.lines.text,
+                text:
+                  match.lines.text.length > 2_000
+                    ? match.lines.text.slice(0, 2_000).replace(/[\uD800-\uDBFF]$/, "") + "..."
+                    : match.lines.text,
                 submatches: match.submatches.map((submatch) => ({
                   text: submatch.match.text,
                   start: submatch.start,

@@ -55,9 +55,21 @@ export type OpenDiffFn = (diff: {
   patch?: string // kilocode_change
   additions: number
   deletions: number
+  status?: "added" | "deleted" | "modified" // kilocode_change
+  // kilocode_change start - multi-file patch preview payload
+  files?: Array<{
+    file: string
+    before?: string
+    after?: string
+    patch?: string
+    additions: number
+    deletions: number
+    status?: "added" | "deleted" | "modified" // kilocode_change
+  }>
+  // kilocode_change end
 }) => void
 
-export type OpenUrlFn = (url: string) => void
+export type OpenUrlFn = (url: string, sessionID?: string) => void // kilocode_change - optional sessionID scopes the open
 
 export type OpenContentFn = (content: string, language?: string) => void // kilocode_change
 
@@ -79,6 +91,9 @@ export const { use: useData, provider: DataProvider } = createSimpleContext({
     onOpenUrl?: OpenUrlFn // kilocode_change
     onOpenContent?: OpenContentFn // kilocode_change
     onValidateFiles?: ValidateFilesFn // kilocode_change
+    // kilocode_change start - web links open in the Integrated Browser
+    browserLinks?: boolean // kilocode_change
+    // kilocode_change end
   }) => {
     return {
       get store() {
@@ -94,6 +109,12 @@ export const { use: useData, provider: DataProvider } = createSimpleContext({
       openUrl: props.onOpenUrl, // kilocode_change
       openContent: props.onOpenContent, // kilocode_change
       validateFiles: props.onValidateFiles, // kilocode_change
+      // kilocode_change start
+      get browserLinks() {
+        // kilocode_change
+        return props.browserLinks // kilocode_change
+      }, // kilocode_change
+      // kilocode_change end
     }
   },
 })

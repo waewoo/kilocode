@@ -14,7 +14,7 @@ function message(finish?: string, error?: Message["error"]): Message {
 }
 
 function todo(status: TodoItem["status"]): TodoItem {
-  return { id: status, content: status, status }
+  return { content: status, status }
 }
 
 describe("terminal", () => {
@@ -121,6 +121,7 @@ describe("terminal", () => {
       remaining: 1,
     })
     expect(terminal({ reason: "error", messages: [message("error")], todos: [] })?.kind).toBe("error")
+    expect(terminal({ reason: "error", messages: [message("stop")], todos: [] })?.kind).toBe("error")
   })
 
   it("does not duplicate a concrete rendered failure", () => {

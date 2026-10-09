@@ -5,23 +5,26 @@ package ai.kilocode.backend.rpc
 import ai.kilocode.backend.app.KiloAppState
 import ai.kilocode.backend.app.KiloBackendAppService
 import ai.kilocode.backend.telemetry.KiloBackendTelemetry
-import ai.kilocode.backend.app.ConfigWarning
 import ai.kilocode.backend.app.LoadError
 import ai.kilocode.backend.app.LoadProgress
 import ai.kilocode.backend.app.ProfileResult
 import ai.kilocode.backend.cli.KiloCliPlatform
 import ai.kilocode.backend.cli.KiloProps
 import ai.kilocode.backend.cli.KiloRepoCli
+import ai.kilocode.backend.workspace.KiloWorktreeIndexSettings
 import ai.kilocode.jetbrains.api.model.KiloProfile200Response
+import ai.kilocode.log.KiloLog
+import ai.kilocode.log.LogConfig
 import ai.kilocode.rpc.dto.ConfigPatchDto
 import ai.kilocode.rpc.KiloAppRpcApi
-import ai.kilocode.rpc.dto.ConfigWarningDto
 import ai.kilocode.rpc.dto.DeviceAuthDto
 import ai.kilocode.rpc.dto.HealthDto
 import ai.kilocode.rpc.dto.KiloAppStateDto
 import ai.kilocode.rpc.dto.KiloAppStatusDto
 import ai.kilocode.rpc.dto.LoadErrorDto
 import ai.kilocode.rpc.dto.LoadProgressDto
+import ai.kilocode.rpc.dto.LogConfigDto
+import ai.kilocode.rpc.dto.LogFileDto
 import ai.kilocode.rpc.dto.ModelFavoriteUpdateDto
 import ai.kilocode.rpc.dto.ModelSelectionUpdateDto
 import ai.kilocode.rpc.dto.ModelStateDto
@@ -31,11 +34,21 @@ import ai.kilocode.rpc.dto.ProfileDto
 import ai.kilocode.rpc.dto.ProfileKiloPassDto
 import ai.kilocode.rpc.dto.ProfileOrganizationDto
 import ai.kilocode.rpc.dto.ProfileStatusDto
+import ai.kilocode.rpc.dto.RetentionStatusDto
 import ai.kilocode.rpc.dto.TelemetryCaptureDto
+import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.application.writeAction
 import com.intellij.openapi.components.service
+import com.intellij.openapi.project.ProjectManager
+import com.intellij.openapi.project.RootsChangeRescanningInfo
+import com.intellij.openapi.roots.ex.ProjectRootManagerEx
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.withContext
+import java.nio.file.Files
 
 /**
  * Backend implementation of [KiloAppRpcApi].
@@ -50,7 +63,8 @@ class KiloAppRpcApiImpl : KiloAppRpcApi {
     override suspend fun connect() = app.connect()
 
     override suspend fun state(): Flow<KiloAppStateDto> =
-        app.appState.map(::dto).distinctUntilChanged()
+        combine(app.appState, app.capabilities) { state, caps -> appStateDto(state, caps) }
+            .distinctUntilChanged()
 
     override suspend fun health(): HealthDto = app.health()
 
@@ -81,11 +95,6 @@ class KiloAppRpcApiImpl : KiloAppRpcApi {
         return app.models.selection(update)
     }
 
-    override suspend fun clearModelSelection(agent: String): ModelStateDto {
-        app.requireReady()
-        return app.models.clear(agent)
-    }
-
     override suspend fun updateModelVariant(update: ModelVariantUpdateDto): ModelStateDto {
         app.requireReady()
         return app.models.variant(update)
@@ -93,7 +102,36 @@ class KiloAppRpcApiImpl : KiloAppRpcApi {
 
     override suspend fun updateConfig(patch: ConfigPatchDto): KiloAppStateDto {
         app.requireReady()
-        return appStateDto(app.updateConfig(patch))
+        return appStateDto(app.updateConfig(patch), app.capabilities.value)
+    }
+
+    override suspend fun retentionStatus(): RetentionStatusDto = app.retention.status()
+
+    override suspend fun runRetention(force: Boolean): RetentionStatusDto = app.retention.run(force)
+
+    override suspend fun applyLogConfig(config: LogConfigDto) {
+        LogConfig.apply(config.level, config.contentMode, config.previewMax)
+    }
+
+    override suspend fun indexWorktrees(): Boolean = KiloWorktreeIndexSettings.get()
+
+    override suspend fun setIndexWorktrees(value: Boolean) {
+        if (KiloWorktreeIndexSettings.get() == value) return
+        KiloWorktreeIndexSettings.set(value)
+        if (ApplicationManager.getApplication() == null) return
+        for (project in ProjectManager.getInstance().openProjects) {
+            if (project.isDisposed) continue
+            writeAction {
+                ProjectRootManagerEx.getInstanceEx(project)
+                    .makeRootsChange({}, RootsChangeRescanningInfo.RESCAN_DEPENDENCIES_IF_NEEDED)
+            }
+        }
+    }
+
+    override suspend fun backendLogFile(): LogFileDto? = withContext(Dispatchers.IO) {
+        val path = KiloLog.logFile()
+        if (!Files.exists(path)) return@withContext null
+        LogFileDto(path.fileName.toString(), Files.readString(path))
     }
 
     override suspend fun refreshProfile(): ProfileDto? = app.refreshProfile()?.let(::profileDto)
@@ -111,11 +149,9 @@ class KiloAppRpcApiImpl : KiloAppRpcApi {
         service<KiloBackendTelemetry>().capture(app.http, app.port, capture.event, capture.properties)
     }
 
-    private fun dto(state: KiloAppState): KiloAppStateDto =
-        appStateDto(state)
 }
 
-internal fun appStateDto(state: KiloAppState): KiloAppStateDto =
+internal fun appStateDto(state: KiloAppState, backgroundSubagents: Boolean = false): KiloAppStateDto =
     when (state) {
         KiloAppState.Disconnected -> KiloAppStateDto(KiloAppStatusDto.DISCONNECTED)
         is KiloAppState.Downloading -> KiloAppStateDto(
@@ -141,9 +177,9 @@ internal fun appStateDto(state: KiloAppState): KiloAppStateDto =
                 profile = if (state.data.profile != null) ProfileStatusDto.LOADED
                     else ProfileStatusDto.NOT_LOGGED_IN,
             ),
-            warnings = state.data.warnings.map(::warning),
             config = state.data.config,
             profile = state.data.profile?.let(::profileDto),
+            backgroundSubagents = backgroundSubagents,
         )
         is KiloAppState.Error -> KiloAppStateDto(
             status = KiloAppStatusDto.ERROR,
@@ -191,10 +227,4 @@ private fun error(e: LoadError) = LoadErrorDto(
     resource = e.resource,
     status = e.status,
     detail = e.detail,
-)
-
-private fun warning(w: ConfigWarning) = ConfigWarningDto(
-    path = w.path,
-    message = w.message,
-    detail = w.detail,
 )

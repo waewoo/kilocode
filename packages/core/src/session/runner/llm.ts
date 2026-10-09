@@ -205,11 +205,18 @@ const layer = Layer.effect(
       const promptCacheKey = /^ses_[0-9a-f]{64}$/.test(session.id) ? session.id.slice(4) : session.id
       const request = LLM.request({
         model,
+        http: {
+          headers: {
+            "x-session-affinity": session.id,
+            "X-Session-Id": session.id,
+            ...(session.parentID ? { "x-parent-session-id": session.parentID } : {}),
+          },
+        },
         providerOptions: { openai: { promptCacheKey } },
         system: [agent.info?.system, system.baseline]
           .filter((part): part is string => part !== undefined && part.length > 0)
           .map(SystemPart.make),
-        messages: [...toLLMMessages(context, model), ...(isLastStep ? [Message.assistant(MAX_STEPS_PROMPT)] : [])],
+        messages: [...toLLMMessages(context, model), ...(isLastStep ? [Message.user(MAX_STEPS_PROMPT)] : [])], // kilocode_change - avoid provider-incompatible assistant prefill
         tools: toolMaterialization?.definitions ?? [],
         toolChoice: isLastStep ? "none" : undefined,
       })

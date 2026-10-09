@@ -4,7 +4,6 @@ import ai.kilocode.client.session.SessionFileOpener
 import ai.kilocode.client.session.model.Permission
 import ai.kilocode.client.session.model.PermissionMeta
 import ai.kilocode.client.session.model.Outcome
-import ai.kilocode.client.session.model.OutcomeTone
 import ai.kilocode.client.session.model.Question
 import ai.kilocode.client.session.model.QuestionItem
 import ai.kilocode.client.session.model.QuestionOption
@@ -23,6 +22,7 @@ import ai.kilocode.client.session.views.permission.PermissionView
 import ai.kilocode.client.session.views.question.QuestionResultView
 import ai.kilocode.client.session.views.question.QuestionView
 import ai.kilocode.client.session.ui.selection.SessionCopyTarget
+import ai.kilocode.client.session.views.MessageErrorView
 import ai.kilocode.client.session.views.MessageToolbar
 import ai.kilocode.client.session.views.MessageView
 import ai.kilocode.client.session.views.PromptAttachmentView
@@ -38,6 +38,7 @@ import ai.kilocode.client.ui.UiStyle
 import ai.kilocode.client.ui.layout.Stack
 import ai.kilocode.rpc.dto.DiffFileDto
 import ai.kilocode.rpc.dto.MessageDto
+import ai.kilocode.rpc.dto.MessageErrorDto
 import ai.kilocode.rpc.dto.MessageSummaryDto
 import ai.kilocode.rpc.dto.MessageTimeDto
 import ai.kilocode.rpc.dto.MessageWithPartsDto
@@ -141,7 +142,255 @@ class SessionMessageListPanelTest : BasePlatformTestCase() {
         assertEquals("1 file", card.countText())
     }
 
-    fun `test transcript content has symmetric side padding`() {
+    // ------ failed turns ------
+
+    fun `test failed message renders the provider text in the transcript`() {
+        model.upsertMessage(msg("a1", "assistant"))
+        assertTrue(cards("a1").isEmpty())
+
+        model.upsertMessage(msg("a1", "assistant").copy(error = failure("The provider ended the response with an error")))
+
+        val card = cards("a1").single()
+        assertEquals("The provider ended the response with an error", card.text())
+        assertSame("The failure belongs after the content it interrupted", card, panel.findMessage("a1")!!.components.last())
+    }
+
+    fun `test failed message with no text falls back to the error type`() {
+        model.upsertMessage(msg("a1", "assistant").copy(error = MessageErrorDto("ProviderAuthError")))
+
+        assertEquals("ProviderAuthError", cards("a1").single().text())
+    }
+
+    /** A Stop is a deliberate user action the footer already reports as "Stopped", not a failure. */
+    fun `test stopped message renders no failure card`() {
+        model.upsertMessage(msg("a1", "assistant").copy(error = MessageErrorDto(MessageErrorDto.ABORTED, "aborted")))
+
+        assertTrue(cards("a1").isEmpty())
+    }
+
+    fun `test repeated retry failures collapse to the last failed attempt in the turn`() {
+        model.upsertMessage(msg("u1", "user"))
+        model.upsertMessage(msg("a1", "assistant").copy(parentID = "u1", error = failure("Missing credentials")))
+        model.upsertMessage(msg("a2", "assistant").copy(parentID = "u1", error = failure("Missing credentials")))
+        model.upsertMessage(msg("a3", "assistant").copy(parentID = "u1", error = failure("Missing credentials")))
+
+        assertTrue(cards("a1").isEmpty())
+        assertTrue(cards("a2").isEmpty())
+        assertEquals("Missing credentials", cards("a3").single().text())
+    }
+
+    fun `test recovered turn hides an earlier failed attempt`() {
+        model.upsertMessage(msg("u1", "user"))
+        model.upsertMessage(msg("a1", "assistant").copy(parentID = "u1", error = failure("Missing credentials")))
+        model.upsertMessage(msg("a2", "assistant").copy(parentID = "u1"))
+
+        assertTrue(cards("a1").isEmpty())
+        assertTrue(cards("a2").isEmpty())
+    }
+
+    /** The transcript keeps the reason; the footer drops its copy and keeps only the action. */
+    fun `test footer offers retry without repeating the message the card shows`() {
+        val item = panelWithRetry { true }
+        model.upsertMessage(msg("a1", "assistant").copy(error = failure("Missing credentials")))
+        model.setState(SessionState.Error("Missing credentials"))
+
+        val ov = find<SessionOutcomeView>(item)!!
+        assertEquals("Missing credentials", cards(item, "a1").single().text())
+        assertTrue(ov.isVisible)
+        assertNull("The reason must not be printed twice", text(ov, "Missing credentials"))
+        assertNotNull(button(ov, KiloBundle.message("session.outcome.retry")))
+    }
+
+    /** Nothing left to offer: the card already says it, and the turn cannot be continued. */
+    fun `test footer hides when the card explains a failure that cannot be retried`() {
+        val item = panelWithRetry { false }
+        model.upsertMessage(msg("a1", "assistant").copy(error = failure("Missing credentials")))
+        model.setState(SessionState.Error("Missing credentials"))
+
+        val ov = find<SessionOutcomeView>(item)!!
+        assertEquals("Missing credentials", cards(item, "a1").single().text())
+        assertFalse(ov.isVisible)
+    }
+
+    /** A failure with no errored message of its own has no card, so the footer still explains it. */
+    fun `test footer keeps the message when the transcript cannot explain it`() {
+        val item = panelWithRetry { true }
+        model.upsertMessage(msg("u1", "user"))
+        model.setState(SessionState.Error("Missing provider credentials", "ProviderAuthError"))
+
+        val ov = find<SessionOutcomeView>(item)!!
+        assertTrue(ov.isVisible)
+        assertNotNull(text(ov, "Missing provider credentials"))
+        assertNotNull(button(ov, KiloBundle.message("session.outcome.retry")))
+    }
+
+    fun `test generic failed close drops its description when the card explains the turn`() {
+        val item = panelWithRetry { true }
+        model.upsertMessage(msg("a1", "assistant").copy(error = failure("Provider overloaded")))
+        model.setState(SessionState.TurnEnded(Outcome.FAILED))
+
+        val ov = find<SessionOutcomeView>(item)!!
+        assertEquals("Provider overloaded", cards(item, "a1").single().text())
+        assertNull(text(ov, KiloBundle.message("session.outcome.failed.description")))
+        assertNotNull(button(ov, KiloBundle.message("session.outcome.retry")))
+    }
+
+    fun `test incomplete outcome shows footer without message failure card`() {
+        val item = panelWithRetry { true }
+        model.upsertMessage(msg("a1", "assistant").copy(finish = "unknown"))
+        model.setState(SessionState.TurnEnded(Outcome.INCOMPLETE, "unknown"))
+
+        val ov = find<SessionOutcomeView>(item)!!
+        assertTrue(cards(item, "a1").isEmpty())
+        assertNotNull(text(ov, KiloBundle.message("session.outcome.incomplete.title")))
+        assertNotNull(text(ov, KiloBundle.message("session.outcome.incomplete.description")))
+        assertNull(button(ov, KiloBundle.message("session.outcome.retry")))
+    }
+
+    fun `test failure landing after the error state still collapses the footer`() {
+        val item = panelWithRetry { true }
+        model.upsertMessage(msg("a1", "assistant"))
+        model.setState(SessionState.Error("Missing credentials"))
+        val ov = find<SessionOutcomeView>(item)!!
+        assertNotNull("Precondition: no card yet, so the footer explains it", text(ov, "Missing credentials"))
+
+        model.upsertMessage(msg("a1", "assistant").copy(error = failure("Missing credentials")))
+
+        assertEquals("Missing credentials", cards(item, "a1").single().text())
+        assertNull("The footer must drop its copy once the card has one", text(ov, "Missing credentials"))
+    }
+
+    /** The card is the durable record, so no session state may take it away. */
+    fun `test failure card survives every state the session moves through`() {
+        model.upsertMessage(msg("a1", "assistant").copy(error = failure("Missing credentials")))
+
+        for (state in listOf(
+            SessionState.Error("Missing credentials"),
+            SessionState.TurnEnded(Outcome.FAILED),
+            SessionState.Busy("thinking"),
+            SessionState.Idle,
+        )) {
+            model.setState(state)
+            assertEquals("card must stay in $state", "Missing credentials", cards("a1").single().text())
+        }
+    }
+
+    fun `test unrelated session error leaves the message failure alone`() {
+        val item = panelWithRetry { true }
+        model.upsertMessage(msg("a1", "assistant").copy(error = failure("Missing credentials")))
+        model.setState(SessionState.Error("Workspace failed"))
+
+        val ov = find<SessionOutcomeView>(item)!!
+        assertEquals("Missing credentials", cards(item, "a1").single().text())
+        assertNotNull("A different failure still needs its own text", text(ov, "Workspace failed"))
+    }
+
+    fun `test history load paints a failure that arrived before the panel existed`() {
+        model.loadHistory(
+            listOf(
+                MessageWithPartsDto(
+                    msg("a1", "assistant").copy(error = failure("Context window exceeded")),
+                    emptyList(),
+                ),
+            ),
+        )
+
+        assertEquals("Context window exceeded", cards("a1").single().text())
+    }
+
+    /**
+     * A superseded failure is history: the user cannot act on it, and a red card stranded between two
+     * later turns is noise. It also keeps the card in lockstep with the footer, which only ever
+     * describes the tail.
+     */
+    fun `test failure card is dropped once a later turn supersedes it`() {
+        model.upsertMessage(msg("a1", "assistant").copy(error = failure("Provider overloaded")))
+        assertEquals("Provider overloaded", cards("a1").single().text())
+
+        model.upsertMessage(msg("u2", "user"))
+        model.upsertMessage(msg("a2", "assistant"))
+
+        assertTrue("Nothing in the middle of the transcript", cards("a1").isEmpty())
+        assertTrue(cards("a2").isEmpty())
+    }
+
+    fun `test only the newest failed turn shows its reason`() {
+        model.upsertMessage(msg("u1", "user"))
+        model.upsertMessage(msg("a1", "assistant").copy(parentID = "u1", error = failure("Missing credentials")))
+        model.upsertMessage(msg("u2", "user"))
+        model.upsertMessage(msg("a2", "assistant").copy(parentID = "u2", error = failure("Missing credentials")))
+
+        assertTrue(cards("a1").isEmpty())
+        assertEquals("Missing credentials", cards("a2").single().text())
+    }
+
+    fun `test clearing the failure removes its card`() {
+        model.upsertMessage(msg("a1", "assistant").copy(error = failure("Provider overloaded")))
+        assertEquals(1, cards("a1").size)
+
+        model.upsertMessage(msg("a1", "assistant"))
+
+        assertTrue(cards("a1").isEmpty())
+    }
+
+    /** message.updated also fires on every token/cost delta, so an unchanged failure must be inert. */
+    fun `test repeated identical failure update does not refresh panel`() {
+        val failed = msg("a1", "assistant").copy(error = failure("Provider overloaded"))
+        model.upsertMessage(failed)
+        val view = panel.findMessage("a1")!!
+        val card = cards("a1").single()
+        val repaint = TrackingRepaintManager(setOf(panel, view, card))
+        val old = RepaintManager.currentManager(panel)
+
+        try {
+            RepaintManager.setCurrentManager(repaint)
+
+            model.upsertMessage(failed)
+
+            assertSame("The card must be reused, not rebuilt", card, cards("a1").single())
+            assertTrue(repaint.dirty.isEmpty())
+            assertTrue(repaint.invalid.isEmpty())
+        } finally {
+            RepaintManager.setCurrentManager(old)
+        }
+    }
+
+    fun `test streamed content stays above the failure card`() {
+        model.upsertMessage(msg("a1", "assistant").copy(error = failure("Provider overloaded")))
+        model.updateContent("a1", part("p1", "a1", "text", "partial answer"))
+
+        val view = panel.findMessage("a1")!!
+        assertTrue(view.components.first() is TextView)
+        assertSame(cards("a1").single(), view.components.last())
+    }
+
+    /**
+     * SessionLayout sizes the card and then reads its preferred size, so the text area has to measure
+     * itself at that width. Reporting an unwrapped single line would clip a long provider error.
+     */
+    fun `test long failure text is measured at the transcript width`() {
+        model.upsertMessage(
+            msg("a1", "assistant").copy(error = failure("Snowflake Cortex: missing credentials. ".repeat(20))),
+        )
+
+        panel.setSize(320, 4000)
+        layout(panel)
+
+        val card = cards("a1").single()
+        val area = components(card).filterIsInstance<JBTextArea>().single()
+        val line = area.getFontMetrics(area.font).height
+        val chrome = area.insets.top + area.insets.bottom
+
+        assertTrue("the card must wrap, not report one line: ${card.height}", card.height > line * 3 + chrome)
+        assertEquals("the card must be exactly as tall as the wrapped text", area.preferredSize.height, card.height)
+    }
+
+    /**
+     * The right side is wider than the left on purpose: the prompt navigator's rail is drawn over that
+     * edge, and the transcript reserves a full-size tick plus the smallest standard gap so a tick never
+     * sits on top of the content.
+     */
+    fun `test transcript reserves the rail edge beside the content`() {
         model.upsertMessage(msg("a1", "assistant"))
 
         panel.setSize(600, 400)
@@ -150,7 +399,9 @@ class SessionMessageListPanelTest : BasePlatformTestCase() {
         val left = turn.x
         val right = panel.width - turn.x - turn.width
 
-        assertEquals(right, left)
+        assertEquals(JBUI.scale(SessionUiStyle.SessionLayout.INNER_HORIZONTAL), left)
+        assertEquals(JBUI.scale(SessionUiStyle.SessionLayout.INNER_RIGHT), right)
+        assertTrue("the rail edge must clear a full-size tick", right >= JBUI.scale(SessionUiStyle.PromptRail.TICK_HOVER))
     }
 
     fun `test reflow drops cached panel measurements`() {
@@ -1042,6 +1293,54 @@ class SessionMessageListPanelTest : BasePlatformTestCase() {
         assertSame(item.progress, item.components.last())
     }
 
+    // ------ reveal resync (hidden-session catch-up) ------
+
+    fun `test syncActiveState resurfaces an active question`() {
+        val item = panelWithPrompts()
+        model.setState(SessionState.AwaitingQuestion(question()))
+
+        val qv = find<QuestionView>(item)!!
+        // Directly force-hide the view the way a stale/hidden component might end up, then
+        // resync from the current model state — this is what SessionUi does when a hidden
+        // session's component becomes visible again.
+        qv.hideView()
+        assertFalse(qv.isVisible)
+
+        item.syncActiveState()
+
+        assertTrue(qv.isVisible)
+        assertSame(item.progress, item.components.last())
+        assertTrue(item.components.indexOf(qv) < item.components.indexOf(item.progress))
+    }
+
+    fun `test syncActiveState resurfaces an active permission`() {
+        val item = panelWithPrompts()
+        model.setState(SessionState.AwaitingPermission(permission()))
+
+        val pv = find<PermissionView>(item)!!
+        pv.hideView()
+        assertFalse(pv.isVisible)
+
+        item.syncActiveState()
+
+        assertTrue(pv.isVisible)
+        assertSame(item.progress, item.components.last())
+    }
+
+    fun `test syncActiveState is a no-op when idle`() {
+        val item = panelWithPrompts()
+        model.upsertMessage(msg("u1", "user"))
+
+        val qv = find<QuestionView>(item)!!
+        val pv = find<PermissionView>(item)!!
+
+        item.syncActiveState()
+
+        assertFalse(qv.isVisible)
+        assertFalse(pv.isVisible)
+        assertSame(item.progress, item.components.last())
+    }
+
     fun `test login required state makes LoginRequiredView visible and hides others`() {
         val item = panelWithPrompts()
         model.setState(SessionState.LoginRequired("Sign in required."))
@@ -1097,20 +1396,20 @@ class SessionMessageListPanelTest : BasePlatformTestCase() {
 
     fun `test turn ended state makes outcome view visible`() {
         val item = panelWithPrompts()
-        model.setState(SessionState.TurnEnded(Outcome.INTERRUPTED, OutcomeTone.WARNING))
+        model.setState(SessionState.TurnEnded(Outcome.INTERRUPTED))
 
         val ov = find<SessionOutcomeView>(item)!!
         val comps = item.components.toList()
 
         assertTrue(ov.isVisible)
-        assertNotNull(text(item, KiloBundle.message("session.outcome.interrupted.description")))
+        assertNotNull(text(item, KiloBundle.message("session.outcome.interrupted.note")))
         assertTrue(comps.indexOf(ov) < comps.indexOf(item.progress))
         assertSame(item.progress, comps.last())
     }
 
     fun `test returning to idle hides outcome view`() {
         val item = panelWithPrompts()
-        model.setState(SessionState.TurnEnded(Outcome.FAILED, OutcomeTone.CRITICAL))
+        model.setState(SessionState.TurnEnded(Outcome.FAILED))
         model.setState(SessionState.Idle)
 
         val ov = find<SessionOutcomeView>(item)!!
@@ -1155,13 +1454,17 @@ class SessionMessageListPanelTest : BasePlatformTestCase() {
         assertNotNull(find<DialogView>(banner))
         assertNotNull(components(banner).filterIsInstance<PartHeader>().singleOrNull())
 
-        val buttons = components(banner).filterIsInstance<JButton>().filter { it.text.isNotEmpty() }
+        val buttons = components(banner).filterIsInstance<JButton>()
+            .filter { it !is ActionLink && it.text.isNotEmpty() }
         assertEquals(
             listOf(KiloBundle.message("revert.banner.redo"), KiloBundle.message("revert.banner.redo.all")),
             buttons.map { it.text },
         )
         assertEquals(listOf(KiloBundle.message("revert.banner.redo")), buttons.filter { it.isVisible }.map { it.text })
-        assertTrue(buttons.all { it.getClientProperty(DarculaButtonUI.DEFAULT_STYLE_KEY) == null })
+        assertEquals(true, buttons.single { it.text == KiloBundle.message("revert.banner.redo") }
+            .getClientProperty(DarculaButtonUI.DEFAULT_STYLE_KEY))
+        assertNull(buttons.single { it.text == KiloBundle.message("revert.banner.redo.all") }
+            .getClientProperty(DarculaButtonUI.DEFAULT_STYLE_KEY))
 
         val hint = components(banner)
             .filterIsInstance<JBLabel>()
@@ -1291,10 +1594,8 @@ class SessionMessageListPanelTest : BasePlatformTestCase() {
 
         banner.update()
 
-        val button = components(banner).filterIsInstance<HoverIcon>()
-            .first { it.toolTipText == KiloBundle.message("session.part.tool.openDiff") }
-        assertFalse(button.isVisible)
-        assertFalse(button.isEnabled)
+        assertTrue(components(banner).filterIsInstance<HoverIcon>()
+            .none { it.toolTipText == KiloBundle.message("session.part.tool.openDiff") })
     }
 
     fun `test rollback banner opens session diff when revert diff is absent`() {
@@ -1377,29 +1678,130 @@ class SessionMessageListPanelTest : BasePlatformTestCase() {
         assertTrue(components(banner).filterIsInstance<RevertProgress>().isEmpty())
     }
 
-    fun `test rollback banner explains snapshotless history only revert`() {
+    fun `test rollback banner explains legacy revert with no workspace status`() {
         val banner = RevertBanner(model, {}, {}, {})
         model.upsertMessage(msg("u1", "user"))
         model.setRevert(SessionRevertDto("u1", snapshot = null))
         banner.update()
 
         val notice = components(banner).filterIsInstance<JBLabel>()
-            .first { it.text == KiloBundle.message("revert.banner.filesNotRestored") }
+            .single { it.name == "revert-workspace-notice" }
 
         assertTrue(notice.isVisible)
+        assertTrue(notice.text.contains(KiloBundle.message("revert.banner.workspace.legacy")))
         assertTrue(components(banner).filterIsInstance<DiffStatBadge>().isEmpty())
     }
 
-    fun `test rollback banner hides snapshotless notice when snapshot exists`() {
+    fun `test rollback banner hides notice when legacy revert has a snapshot`() {
         val banner = RevertBanner(model, {}, {}, {})
         model.upsertMessage(msg("u1", "user"))
         model.setRevert(SessionRevertDto("u1", snapshot = "snap1"))
         banner.update()
 
         val notice = components(banner).filterIsInstance<JBLabel>()
-            .first { it.text == KiloBundle.message("revert.banner.filesNotRestored") }
-
+            .single { it.name == "revert-workspace-notice" }
         assertFalse(notice.isVisible)
+    }
+
+    fun `test rollback banner hides notice when workspace was restored`() {
+        val banner = RevertBanner(model, {}, {}, {})
+        model.upsertMessage(msg("u1", "user"))
+        model.setRevert(SessionRevertDto("u1", snapshot = "snap1", workspace = "restored"))
+        banner.update()
+
+        val notice = components(banner).filterIsInstance<JBLabel>()
+            .single { it.name == "revert-workspace-notice" }
+        assertFalse(notice.isVisible)
+    }
+
+    fun `test rollback banner explains snapshots disabled`() {
+        val banner = RevertBanner(model, {}, {}, {})
+        model.upsertMessage(msg("u1", "user"))
+        model.setRevert(SessionRevertDto("u1", workspace = "snapshots-disabled"))
+        banner.update()
+
+        val notice = components(banner).filterIsInstance<JBLabel>()
+            .single { it.name == "revert-workspace-notice" }
+
+        assertTrue(notice.isVisible)
+        assertTrue(notice.text.startsWith("<html>"))
+        assertTrue(notice.text.contains(KiloBundle.message("revert.banner.workspace.snapshotsDisabled")))
+    }
+
+    fun `test rollback banner opens checkpoints settings only when snapshots are disabled`() {
+        var opened = false
+        val banner = RevertBanner(model, {}, {}, {}, openSettingsAction = { opened = true })
+        model.upsertMessage(msg("u1", "user"))
+        model.setRevert(SessionRevertDto("u1", workspace = "snapshots-disabled"))
+        banner.update()
+
+        val button = components(banner).filterIsInstance<JButton>()
+            .first { it.text == KiloBundle.message("revert.banner.workspace.enableSnapshots") }
+        assertTrue(button.isVisible)
+        button.doClick(0)
+        assertTrue(opened)
+
+        model.setRevert(SessionRevertDto("u1", workspace = "unavailable"))
+        banner.update()
+
+        assertNull(button.parent)
+
+        model.setRevert(SessionRevertDto("u1", snapshot = "snap1", workspace = "restored"))
+        banner.update()
+
+        assertNull(button.parent)
+    }
+
+    fun `test rollback banner retains latest snapshot action state while reverting`() {
+        val banner = RevertBanner(model, {}, {}, {})
+        model.upsertMessage(msg("u1", "user"))
+        model.setRevert(SessionRevertDto("u1", workspace = "unavailable"))
+        banner.update()
+        banner.setReverting(SessionState.Reverting("Rolling back...", SessionState.Reverting.Kind.ROLLBACK, "u1"))
+
+        model.setRevert(SessionRevertDto("u1", workspace = "snapshots-disabled"))
+        banner.update()
+        assertTrue(components(banner).filterIsInstance<RevertProgress>().isNotEmpty())
+        assertTrue(components(banner).filterIsInstance<JButton>()
+            .none { it.text == KiloBundle.message("revert.banner.workspace.enableSnapshots") })
+
+        banner.setReverting(SessionState.Idle)
+        assertTrue(components(banner).filterIsInstance<JButton>()
+            .any { it.text == KiloBundle.message("revert.banner.workspace.enableSnapshots") })
+
+        banner.setReverting(SessionState.Reverting("Rolling back...", SessionState.Reverting.Kind.ROLLBACK, "u1"))
+        model.setRevert(SessionRevertDto("u1", workspace = "unavailable"))
+        banner.update()
+        banner.setReverting(SessionState.Idle)
+
+        assertTrue(components(banner).filterIsInstance<JButton>()
+            .none { it.text == KiloBundle.message("revert.banner.workspace.enableSnapshots") })
+    }
+
+    fun `test rollback banner explains missing checkpoint`() {
+        val banner = RevertBanner(model, {}, {}, {})
+        model.upsertMessage(msg("u1", "user"))
+        model.setRevert(SessionRevertDto("u1", workspace = "unavailable"))
+        banner.update()
+
+        val notice = components(banner).filterIsInstance<JBLabel>()
+            .single { it.name == "revert-workspace-notice" }
+
+        assertTrue(notice.isVisible)
+        assertTrue(notice.text.contains(KiloBundle.message("revert.banner.workspace.unavailable")))
+    }
+
+    fun `test rollback banner explains non-git workspace`() {
+        val banner = RevertBanner(model, {}, {}, {})
+        model.upsertMessage(msg("u1", "user"))
+        model.setRevert(SessionRevertDto("u1", workspace = "not-a-git-repo"))
+        banner.update()
+
+        val notice = components(banner).filterIsInstance<JBLabel>()
+            .single { it.name == "revert-workspace-notice" }
+
+        assertTrue(notice.isVisible)
+        assertTrue(notice.text.contains(KiloBundle.message("revert.banner.workspace.notAGitRepo")))
     }
 
     // ------ question tool suppression ------
@@ -1615,6 +2017,24 @@ class SessionMessageListPanelTest : BasePlatformTestCase() {
     private fun msg(id: String, role: String) = MessageDto(
         id = id, sessionID = "ses", role = role, time = MessageTimeDto(0.0),
     )
+
+    private fun failure(message: String) = MessageErrorDto("APIError", message)
+
+    private fun cards(msgId: String): List<MessageErrorView> = cards(panel, msgId)
+
+    private fun cards(item: SessionMessageListPanel, msgId: String): List<MessageErrorView> {
+        val view = item.findMessage(msgId) ?: return emptyList()
+        return components(view).filterIsInstance<MessageErrorView>()
+    }
+
+    /** Panel whose footer can offer Retry, so the split between card text and footer action is testable. */
+    private fun panelWithRetry(retryable: () -> Boolean): SessionMessageListPanel {
+        val o = SessionOutcomeView(retry = {}, retryable = retryable)
+        return SessionMessageListPanel(model, parent, openFile = openFile).also { it.outcome = o }
+    }
+
+    private fun button(root: Container, label: String) =
+        components(root).filterIsInstance<JButton>().firstOrNull { it.text == label }
 
     private fun summary(path: String) = MessageSummaryDto(
         diffs = listOf(DiffFileDto(path, 2, 1, PATCH)),

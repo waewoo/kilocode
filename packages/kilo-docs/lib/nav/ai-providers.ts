@@ -37,6 +37,7 @@ export const AiProvidersNav: NavSection[] = [
         href: "/ai-providers/vercel-ai-gateway",
         children: "Vercel AI Gateway",
       },
+      { href: "/ai-providers/edenai", children: "Eden AI" },
     ],
   },
   {
@@ -50,6 +51,7 @@ export const AiProvidersNav: NavSection[] = [
       { href: "/ai-providers/cerebras", children: "Cerebras" },
       { href: "/ai-providers/fireworks", children: "Fireworks AI" },
       { href: "/ai-providers/mixlayer", children: "Mixlayer" },
+      { href: "/ai-providers/nebius", children: "Nebius Token Factory" },
     ],
   },
   {

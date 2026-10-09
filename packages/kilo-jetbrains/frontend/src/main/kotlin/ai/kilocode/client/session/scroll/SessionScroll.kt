@@ -140,9 +140,23 @@ internal class SessionScroll(
         }
     }
 
+    /**
+     * Re-pins the bottom, but only when the transcript is already following it. Call this after
+     * anything that will resize the viewport or the content (transcript reflow, the branch dock
+     * taking or releasing its row above the prompt): it clears a pending user-gesture flag before
+     * the relayout can be mistaken for a scroll away from the bottom.
+     *
+     * The not-following case deliberately only refreshes the jump button. Routing it through
+     * [followBottom] with `false` would bump the generation counter and abort in-flight multi-pass
+     * chains (e.g. the redo [scrollMessageBottom] pass) on the first streamed content growth.
+     */
     @RequiresEdt
     fun followTail() {
-        followBottom(component.viewport.view === messages && tail)
+        if (following()) {
+            followBottom(true)
+            return
+        }
+        updateJump()
     }
 
     @RequiresEdt
@@ -162,6 +176,42 @@ internal class SessionScroll(
         }
         ApplicationManager.getApplication().invokeLater {
             messagePass(gen, id, FOLLOW_PASSES)
+        }
+        return true
+    }
+
+    /**
+     * Scrolls so [id]'s turn sits at the top of the viewport, like [scrollMessageBottom] but anchored to
+     * the top of the turn rather than the bottom of a message — used by the prompt navigator, whose
+     * ticks jump to where a prompt starts rather than where the transcript ends.
+     */
+    @RequiresEdt
+    fun scrollMessageTop(id: String): Boolean = scrollTop { messages.findTurn(id) }
+
+    @RequiresEdt
+    fun scrollPart(messageId: String, partId: String): Boolean = scrollTop {
+        val message = messages.findMessage(messageId)?.takeIf { it.isVisible } ?: return@scrollTop null
+        // Step-finish entries have no part view; navigate to their containing message instead.
+        message.part(partId)?.takeIf { it.isVisible } ?: message
+    }
+
+    @RequiresEdt
+    private fun scrollTop(find: () -> JComponent?): Boolean {
+        val target = find() ?: return false
+        if (!target.isVisible) return false
+        user = false
+        pause = false
+        stable = -1
+        auto = true
+        show(messages)
+        auto = false
+        val gen = ++seq
+        if (SwingUtilities.isEventDispatchThread()) {
+            topPass(gen, find, FOLLOW_PASSES)
+            return true
+        }
+        ApplicationManager.getApplication().invokeLater {
+            topPass(gen, find, FOLLOW_PASSES)
         }
         return true
     }
@@ -359,6 +409,43 @@ internal class SessionScroll(
     }
 
     @RequiresEdt
+    private fun topPass(id: Int, find: () -> JComponent?, remaining: Int) {
+        if (id != seq) return
+        val target = find()
+        if (target == null || !target.isVisible) {
+            stable = -1
+            updateJump()
+            return
+        }
+        auto = true
+        try {
+            layoutScroll()
+            val y = messageTop(target)
+            component.viewport.viewPosition = Point(0, y)
+            bar.value = y
+            // Not near(): a top-anchored jump to a short latest turn lands within the follow threshold
+            // of the bottom, and re-arming follow there would let the next streamed delta pull the view
+            // back down and undo the jump. Only a transcript that cannot scroll stays followed, where
+            // there is nothing for follow to move.
+            tail = bar.maximum <= bar.visibleAmount
+            updateJump()
+        } finally {
+            auto = false
+        }
+        syncValue()
+        if (remaining <= 0) {
+            stable = -1
+            return
+        }
+        val next = messageTop(target)
+        val left = if (next == stable) remaining - 1 else FOLLOW_PASSES
+        stable = next
+        ApplicationManager.getApplication().invokeLater {
+            topPass(id, find, left)
+        }
+    }
+
+    @RequiresEdt
     private fun layoutScroll() {
         component.validate()
     }
@@ -378,6 +465,12 @@ internal class SessionScroll(
         val point = SwingUtilities.convertPoint(target, Point(0, target.height.coerceAtLeast(1)), messages)
         val extent = component.viewport.extentSize.height
         return (point.y - extent).coerceIn(0, bottom())
+    }
+
+    @RequiresEdt
+    private fun messageTop(target: JComponent): Int {
+        val point = SwingUtilities.convertPoint(target, Point(0, 0), messages)
+        return point.y.coerceIn(0, bottom())
     }
 
     @RequiresEdt
@@ -467,10 +560,7 @@ internal class SessionScroll(
             updateJump()
             return
         }
-        // Only re-pin when following. Routing the not-following case through followBottom(false)
-        // would bump seq and abort in-flight multi-pass chains (e.g. the redo scrollMessageBottom
-        // pass) on the first streamed content growth. When not following, just refresh the jump button.
-        if (following()) followTail() else updateJump()
+        followTail()
     }
 
     @RequiresEdt

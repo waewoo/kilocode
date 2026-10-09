@@ -1,5 +1,4 @@
 import { cmd } from "@/cli/cmd/cmd"
-import { Rpc } from "@/util/rpc"
 import { type rpc } from "../tui/worker"
 import path from "path"
 import { text as streamText } from "node:stream/consumers"
@@ -14,7 +13,7 @@ import type { EventSource } from "@opencode-ai/tui/context/sdk"
 import { writeHeapSnapshot } from "v8"
 import type { StartInput } from "@/kilocode/cli/cmd/tui/thread" // kilocode_change - runtime imports deferred into handlers
 import { win32InstallCtrlCGuard } from "@opencode-ai/tui/terminal-win32"
-import { validateSession } from "../tui/validate-session"
+import { validate as validateSession } from "@/kilocode/cli/cmd/tui" // kilocode_change
 // kilocode_change start - correlate the TUI worker with its parent process
 import {
   KILO_PROCESS_ROLE,
@@ -25,12 +24,13 @@ import {
 // kilocode_change end
 import type { RemoteExitBridgeClient } from "@/kilocode/cli/cmd/tui/remote-exit-bridge" // kilocode_change - runtime import deferred
 import type { Exit } from "@opencode-ai/tui/context/exit" // kilocode_change
+import { KiloRpc } from "@/kilocode/util/rpc" // kilocode_change - gates requests on worker readiness
 
 declare global {
   const KILO_WORKER_PATH: string
 }
 
-type RpcClient = ReturnType<typeof Rpc.client<typeof rpc>>
+type RpcClient = ReturnType<typeof KiloRpc.client<typeof rpc>> // kilocode_change
 
 // kilocode_change start - bridge remote exit only for the embedded worker transport
 export function embeddedRemoteExitClient<T>(external: boolean, client: T | undefined): T | undefined {
@@ -276,7 +276,7 @@ export const TuiThreadCommand = cmd({
       exiting: false,
     }
     try {
-      const { TuiConfig } = await import("@/config/tui")
+      // kilocode_change
       if (args.fork && !args.continue && !args.session) {
         UI.error("--fork requires --continue or --session")
         process.exitCode = 1
@@ -333,7 +333,7 @@ export const TuiThreadCommand = cmd({
       worker.onerror = (e) => {
         console.error("TUI worker error", e.error ?? e.message)
       }
-      const client = Rpc.client<typeof rpc>(worker)
+      const client = KiloRpc.client<typeof rpc>(worker) // kilocode_change - queues until the worker is ready
       const reload = () => {
         client.call("reload", undefined).catch((err) => console.error("TUI worker reload failed", err))
       }
@@ -417,7 +417,18 @@ export const TuiThreadCommand = cmd({
       orphanWatch.unref()
       // kilocode_change end
 
+      // kilocode_change start - a worker that never answers used to leave the TUI on a blank
+      // screen forever. The client queues requests until it is ready, so surface the failure
+      // here and exit through the normal shutdown path instead of hanging.
+      if (!(await client.ready)) {
+        UI.error(`TUI worker did not start within ${client.timeout / 1000}s`)
+        shutdownAndExit({ reason: "worker-timeout", code: 1 })
+        return
+      }
+      // kilocode_change end
+
       const prompt = await input(args.prompt)
+      const { TuiConfig } = await import("@/config/tui") // kilocode_change
       const config = await TuiConfig.get()
 
       const network = resolveNetworkOptionsNoConfig(args)

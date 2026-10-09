@@ -21,6 +21,11 @@ const SHARE_OPTIONS: ShareOption[] = [
   { value: "disabled", labelKey: "settings.experimental.share.disabled" },
 ]
 
+const LINK_OPTIONS: ShareOption[] = [
+  { value: "external", labelKey: "settings.experimental.browserLinks.external" },
+  { value: "integrated", labelKey: "settings.experimental.browserLinks.integrated" },
+]
+
 const ExperimentalTab: Component = () => {
   const { config, settings, updateConfig, applySetting } = useConfig()
   const language = useLanguage()
@@ -205,15 +210,95 @@ const ExperimentalTab: Component = () => {
         </SettingsRow>
 
         <SettingsRow
-          title={language.t("settings.experimental.multiProject.title")}
-          description={language.t("settings.experimental.multiProject.description")}
+          title={language.t("settings.experimental.codeMode.title")}
+          description={language.t("settings.experimental.codeMode.description")}
         >
           <Switch
-            checked={settings().multiProject === true}
-            onChange={(checked) => applySetting("multiProject", checked, "experimental.multiProject")}
+            checked={experimental().code_mode ?? false}
+            onChange={(checked) => updateExperimental("code_mode", checked)}
             hideLabel
           >
-            {language.t("settings.experimental.multiProject.title")}
+            {language.t("settings.experimental.codeMode.title")}
+          </Switch>
+        </SettingsRow>
+
+        <SettingsRow
+          title={language.t("settings.experimental.claudeMigration.title")}
+          description={language.t("settings.experimental.claudeMigration.description")}
+        >
+          <Switch
+            checked={settings().claudeMigration === true}
+            onChange={(checked) => applySetting("claudeMigration", checked, "experimental.claudeMigration")}
+            hideLabel
+          >
+            {language.t("settings.experimental.claudeMigration.title")}
+          </Switch>
+        </SettingsRow>
+
+        <SettingsRow
+          title={language.t("settings.experimental.conversationPromptHistory.title")}
+          description={language.t("settings.experimental.conversationPromptHistory.description")}
+        >
+          <Switch
+            checked={settings().conversationPromptHistory === true}
+            onChange={(checked) =>
+              applySetting("conversationPromptHistory", checked, "experimental.conversationPromptHistory")
+            }
+            hideLabel
+          >
+            {language.t("settings.experimental.conversationPromptHistory.title")}
+          </Switch>
+        </SettingsRow>
+
+        <SettingsRow
+          title={language.t("settings.experimental.browserAutomation.title")}
+          description={language.t("settings.experimental.browserAutomation.description")}
+        >
+          <Switch
+            checked={settings().browserAutomation === true}
+            onChange={(checked) => applySetting("browserAutomation", checked, "experimental.browserAutomation")}
+            hideLabel
+          >
+            {language.t("settings.experimental.browserAutomation.title")}
+          </Switch>
+        </SettingsRow>
+
+        <Show when={settings().browserAutomation === true}>
+          <SettingsRow
+            title={language.t("settings.experimental.browserLinks.title")}
+            description={language.t("settings.experimental.browserLinks.description")}
+          >
+            <Select
+              options={LINK_OPTIONS}
+              current={LINK_OPTIONS.find(
+                (o) => o.value === (settings().agentManagerBrowserOpenLinksIn ?? "integrated"),
+              )}
+              value={(o) => o.value}
+              label={(o) => language.t(o.labelKey)}
+              onSelect={(o) => {
+                if (!o) return
+                if (o.value === (settings().agentManagerBrowserOpenLinksIn ?? "integrated")) return
+                applySetting("agentManagerBrowserOpenLinksIn", o.value, "agentManager.browser.openLinksIn")
+              }}
+              variant="secondary"
+              size="small"
+              triggerVariant="settings"
+            />
+          </SettingsRow>
+        </Show>
+
+        <SettingsRow
+          title={language.t("settings.experimental.browserAutomation.systemChrome.title")}
+          description={language.t("settings.experimental.browserAutomation.systemChrome.description")}
+        >
+          <Switch
+            checked={settings().agentManagerBrowserUseSystemChrome !== false}
+            onChange={(checked) =>
+              applySetting("agentManagerBrowserUseSystemChrome", checked, "agentManager.browser.useSystemChrome")
+            }
+            hideLabel
+          >
+            {language.t("settings.experimental.browserAutomation.systemChrome.title")}
           </Switch>
         </SettingsRow>
 

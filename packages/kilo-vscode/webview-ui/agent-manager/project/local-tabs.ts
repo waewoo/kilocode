@@ -1,5 +1,27 @@
 import { createEffect, createMemo, onCleanup } from "solid-js"
-import type { SessionInfo } from "../../src/types/messages/sessions"
+import type { ProjectSessionInfo, SessionInfo } from "../../src/types/messages/sessions"
+import type { AgentManagerStateMessage } from "../../src/types/messages"
+import type { SessionCreatedMessage } from "../../src/types/messages"
+import type { ProjectStore } from "./store"
+import { replacePendingTab, openSessionTab } from "../../src/utils/local-tabs"
+import { replaceInTabOrder } from "../tab-order"
+
+/** Retain a background creation without selecting it in the foreground project. */
+export function backgroundCreated(store: ProjectStore, created: SessionCreatedMessage): boolean {
+  const id = created.session.id
+  if (store.managedSessions().some((session) => session.id === id && session.worktreeId !== null)) return false
+  const ids = store.tabs.ids()
+  const pending = created.draftID && ids.includes(created.draftID) ? created.draftID : undefined
+  if (!pending && ids.includes(id)) return false
+  store.tabs.set((pending ? replacePendingTab({ ids }, pending, id) : openSessionTab({ ids }, id)).ids)
+  const order = store.tabOrder().local ?? []
+  const next = (pending ? replaceInTabOrder(order, pending, id) : undefined) ?? [
+    ...order.filter((value) => value !== id),
+    id,
+  ]
+  store.setTabOrder((prev) => ({ ...prev, local: next }))
+  return true
+}
 
 /**
  * Persist open tabs and panel widths to webview state for recovery.
@@ -56,4 +78,26 @@ export function createLocalSessions(opts: {
     }
     return result
   })
+}
+
+export function needsLocalDraft(sessions: readonly string[], terminals: readonly { id: string }[]): boolean {
+  return sessions.length === 0 && terminals.length === 0
+}
+
+export function projectLocalIds(state: AgentManagerStateMessage | undefined): string[] {
+  return state?.sessions.filter((item) => item.worktreeId === null).map((item) => item.id) ?? []
+}
+
+export function projectLocalSessions(
+  live: ProjectSessionInfo[],
+  ids: string[],
+  isPending: (id: string) => boolean,
+): SessionInfo[] {
+  const now = new Date().toISOString()
+  const known = new Map(live.filter((item) => item.worktreeId === null).map((item) => [item.id, item]))
+  for (const id of ids) {
+    if (isPending(id) || known.has(id)) continue
+    known.set(id, { id, parentID: null, createdAt: now, updatedAt: now, worktreeId: null })
+  }
+  return [...known.values()]
 }

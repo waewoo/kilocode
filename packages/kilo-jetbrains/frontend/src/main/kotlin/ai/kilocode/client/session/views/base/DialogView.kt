@@ -8,6 +8,8 @@ import ai.kilocode.client.ui.RoundedContentPanel
 import ai.kilocode.client.ui.UiStyle
 import ai.kilocode.client.ui.layout.Stack
 import com.intellij.ide.ui.laf.darcula.ui.DarculaButtonUI
+import com.intellij.openapi.actionSystem.DataSink
+import com.intellij.openapi.actionSystem.UiDataProvider
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBTextArea
 import com.intellij.util.concurrency.annotations.RequiresEdt
@@ -41,7 +43,7 @@ open class DialogView(
     private val selection: SessionSelection? = null,
     private val focus: (() -> Unit)? = null,
     // Insets are owned by syncInsets(); the super border is a placeholder it overwrites.
-) : RoundedContentPanel(0, 0), SessionEditorStyleTarget {
+) : RoundedContentPanel(0, 0), SessionEditorStyleTarget, UiDataProvider {
 
     // ---- Action descriptor ----
 
@@ -87,7 +89,10 @@ open class DialogView(
         isVisible = false
     }
 
-    private val headerText: JBTextArea = makeText("", SessionUiStyle.Colors.foreground(), bold = true)
+    // Both rows start blank, so both start hidden; setHeader/setDescription drive visibility from text.
+    private val headerText: JBTextArea = makeText("", SessionUiStyle.Colors.foreground(), bold = true).apply {
+        isVisible = false
+    }
     private val descriptionText: JBTextArea = makeText("", SessionUiStyle.Text.Secondary.foreground(), bold = false).apply {
         isVisible = false
     }
@@ -95,6 +100,8 @@ open class DialogView(
     private var top: JComponent? = null
     private var content: JComponent? = null
     private var actionLeft: JComponent? = null
+    private var leftActionId: String? = null
+    private var leftActionButton: JButton? = null
 
     // Top inset value used when top padding is on; QuestionView sets a non-standard step here.
     private var topInset = UiStyle.Gap.pad()
@@ -106,11 +113,22 @@ open class DialogView(
     private var padLeft = true
     private var padRight = true
     private var padBottom = true
+    private var outlined = true
 
     // action buttons keyed by id for retained updates
     private val actionButtons = mutableMapOf<String, JButton>()
     private val actionHandlers = mutableMapOf<String, () -> Unit>()
     private val actionOrder = mutableListOf<String>()
+    private var defaultActionId: String? = null
+
+    private val defaultAction = object : DefaultDialogAction {
+        override val enabled: Boolean
+            get() = defaultButton()?.let { it.isEnabled && it.isVisible } == true
+
+        override fun submit() {
+            defaultButton()?.takeIf { it.isEnabled && it.isVisible }?.doClick()
+        }
+    }
 
     private val mainActions = Stack.horizontal(gap = UiStyle.Gap.sm())
 
@@ -137,6 +155,7 @@ open class DialogView(
     @RequiresEdt
     fun setHeader(text: String, description: String? = null) {
         headerText.text = text
+        headerText.isVisible = text.isNotBlank()
         setDescription(description)
         syncNorth()
     }
@@ -241,6 +260,7 @@ open class DialogView(
             actionHandlers.remove(it)
         }
         actionOrder.clear()
+        defaultActionId = actions.firstOrNull { it.primary }?.id
         mainActions.removeAll()
         for (action in actions) {
             val btn = actionButtons[action.id] ?: makeButton(action.id, action.text).also { actionButtons[action.id] = it }
@@ -253,6 +273,10 @@ open class DialogView(
             mainActions.next(btn)
         }
         syncFooter()
+    }
+
+    override fun uiDataSnapshot(sink: DataSink) {
+        if (defaultActionId != null) sink[DialogDataKeys.DEFAULT_ACTION] = defaultAction
     }
 
     /**
@@ -279,6 +303,38 @@ open class DialogView(
         syncFooter()
     }
 
+    /** Render a standard retained dialog action on the left side of the footer. */
+    @RequiresEdt
+    fun setLeftAction(action: Action?) {
+        val previous = leftActionButton
+        val showingRetained = actionLeft == null || actionLeft === previous
+        if (action == null) {
+            leftActionId?.let(actionHandlers::remove)
+            leftActionId = null
+            if (showingRetained) setActionLeft(null)
+            return
+        }
+        val btn = if (leftActionId == action.id) {
+            leftActionButton ?: makeButton(action.id, action.text)
+        } else {
+            leftActionId?.let(actionHandlers::remove)
+            makeButton(action.id, action.text)
+        }
+        leftActionId = action.id
+        leftActionButton = btn
+        actionHandlers[action.id] = action.handler
+        btn.text = action.text
+        btn.isEnabled = action.enabled
+        btn.putClientProperty(DarculaButtonUI.DEFAULT_STYLE_KEY, if (action.primary) true else null)
+        if (showingRetained) setActionLeft(btn)
+    }
+
+    /** Reattach the retained left action after a temporary [setActionLeft] component. */
+    @RequiresEdt
+    fun restoreLeftAction() {
+        setActionLeft(leftActionButton.takeIf { leftActionId != null })
+    }
+
     /**
      * Show or hide a specific action button identified by [id].
      * No-ops if the id is not found.
@@ -303,6 +359,17 @@ open class DialogView(
         btn.text = text
     }
 
+    /**
+     * Toggle the card's chrome. Outlined (the default) paints the dialog surface fill plus the
+     * outline; disabling it drops both, leaving the content flush with the session backdrop.
+     */
+    @RequiresEdt
+    fun setOutlined(value: Boolean) {
+        if (outlined == value) return
+        outlined = value
+        repaint()
+    }
+
     /** Returns the retained action component for focus management, or this card when absent. */
     @RequiresEdt
     fun preferredActionComponent(id: String): JComponent = actionButtons[id] ?: this
@@ -325,11 +392,22 @@ open class DialogView(
 
     // ---- contentColor override ----
 
-    override fun contentColor(): Color = SessionUiStyle.View.Surface.bgColor()
+    override fun contentColor(): Color =
+        if (outlined) SessionUiStyle.View.Dialog.bgColor() else SessionUiStyle.View.Surface.bgColor()
 
-    override fun outlineColor(): Color = SessionUiStyle.View.Outline.brightColor()
+    /**
+     * The painted surface depends on [outlined], which is still `false` while the super constructor
+     * assigns `background = contentColor()`, and it changes again on every [setOutlined] call.
+     * Deriving the background here keeps the reported color equal to the one the card actually
+     * paints instead of leaving a stale value behind from construction.
+     */
+    override fun getBackground(): Color = contentColor()
+
+    override fun outlineColor(): Color? = if (outlined) SessionUiStyle.View.Dialog.outlineColor() else null
 
     // ---- private helpers ----
+
+    private fun defaultButton(): JButton? = defaultActionId?.let(actionButtons::get)
 
     private fun syncNorth() {
         north.removeAll()
@@ -340,7 +418,7 @@ open class DialogView(
         north.repaint()
     }
 
-    private fun hasHeader() = icon.icon != null || headerText.text.isNotBlank() || descriptionText.isVisible
+    private fun hasHeader() = icon.icon != null || headerText.isVisible || descriptionText.isVisible
 
     private fun syncInsets() {
         val side = UiStyle.Gap.pad()

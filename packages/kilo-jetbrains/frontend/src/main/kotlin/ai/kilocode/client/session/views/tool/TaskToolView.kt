@@ -1,19 +1,31 @@
 package ai.kilocode.client.session.views.tool
 
 import ai.kilocode.client.plugin.KiloBundle
+import ai.kilocode.client.session.AgentAvatar
 import ai.kilocode.client.session.model.Content
 import ai.kilocode.client.session.model.Tool
 import ai.kilocode.client.session.model.ToolExecState
 import ai.kilocode.client.session.ui.SessionCodeScroll
+import ai.kilocode.client.session.ui.popup.HeaderPopupBody
+import ai.kilocode.client.session.ui.popup.HeaderPopupRequest
+import ai.kilocode.client.session.ui.selection.SessionCopyTarget
 import ai.kilocode.client.session.ui.selection.SessionSelection
 import ai.kilocode.client.session.ui.style.SessionEditorStyle
 import ai.kilocode.client.session.ui.style.SessionUiStyle
+import ai.kilocode.client.session.views.BackgroundPromote
+import ai.kilocode.client.session.views.SessionViewIcons
 import ai.kilocode.client.session.views.base.AbstractSessionPartView
+import ai.kilocode.client.session.views.base.HeaderOpenAction
+import ai.kilocode.client.ui.HoverIcon
+import ai.kilocode.client.ui.PlainLabel
 import ai.kilocode.client.ui.UiStyle
 import ai.kilocode.client.ui.layout.Stack
 import ai.kilocode.client.ui.layout.StackAxis
+import com.intellij.openapi.Disposable
 import com.intellij.openapi.actionSystem.DataSink
 import com.intellij.openapi.actionSystem.UiDataProvider
+import com.intellij.openapi.util.Disposer
+import com.intellij.openapi.util.IconLoader
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.util.concurrency.annotations.RequiresEdt
@@ -22,6 +34,7 @@ import java.awt.BorderLayout
 import java.awt.Dimension
 import java.awt.Point
 import java.awt.Rectangle
+import javax.swing.JComponent
 import javax.swing.JPanel
 import javax.swing.ScrollPaneConstants
 import javax.swing.Scrollable
@@ -31,25 +44,64 @@ import kotlin.math.abs
 class TaskToolView(
     tool: Tool,
     private val selection: SessionSelection? = null,
+    private val onOpenSubagent: ((String, String) -> Unit)? = null,
+    private val onPromoteBackgroundAgent: BackgroundPromote? = null,
+    /** Sibling color slot for the task's child session's generated avatar. See [AgentAvatar]. */
+    private val avatarColor: (String) -> Int? = { null },
     private val parts: ToolParts = toolParts(tool),
-) : AbstractSessionPartView(parts.header, { TaskBody(parts.glyph).scroll }), UiDataProvider {
+    private val footer: ToolApprovalFooter = ToolApprovalFooter(),
+) : AbstractSessionPartView(parts.header, { TaskBody(parts.glyph).scroll }, { footer }), UiDataProvider, ApprovalReasonTarget, SessionCopyTarget {
 
     override val contentId: String = tool.id
 
     private var item = tool
     private var style = SessionEditorStyle.current()
     private val rows = LinkedHashMap<String, Row>()
+    // Recreated only when the child session id or its resolved sibling color changes; a state-only
+    // change (pending/running/completed/error) just swaps between these two retained icons.
+    private var avatarId = ""
+    private var avatarColorSlot: Int? = null
+    private var avatarStatic = AgentAvatar.static(avatarId, avatarColorSlot)
+    private var avatarRunning = AgentAvatar.running(avatarId, avatarColorSlot)
     private var following = false
     private var collapsed = false
+    private var popup: HeaderPopupBody? = null
+    // Same hover open-in-editor affordance as the edit/patch and modified-files cards.
+    private val open = HeaderOpenAction(
+        SessionViewIcons.openDiff,
+        KiloBundle.message("session.part.tool.openSubagent"),
+        ::openSubagent,
+    )
+
+    // A plain inline button, not a hover overlay: SessionCopyTarget only reserves the hover-copy
+    // slot for one control (open.anchor), and this action only applies to a running foreground task.
+    private val promoteButton = HoverIcon().apply {
+        icon = CONTINUE_IN_BACKGROUND_ICON
+        isFocusable = false
+        isVisible = false
+        toolTipText = KiloBundle.message("session.part.tool.continueInBackground")
+        addActionListener { promoteBackgroundAgent() }
+    }
 
     init {
+        // Mirror the edit/patch cards: move the summary and the open action into the non-fit left
+        // group so the anchor always reserves its width right after the text. Left in the fill slot
+        // (a fitHorizontal stack), a long summary would clip the trailing anchor to zero width and
+        // the hover open control could fail to appear.
+        parts.header.left(parts.sub, promoteButton, open.anchor)
         applyStyle(style)
         sync()
         if (item.childTools.isNotEmpty()) expand()
     }
 
+    override val copyEligible: Boolean get() = item.childSessionId != null && onOpenSubagent != null
+    override val copyAnchor: JComponent get() = open.anchor
+    override val copyToolbar: JComponent get() = open.button
+
+    override fun copyText(): String? = null
+
     override fun uiDataSnapshot(sink: DataSink) {
-        selection?.provideCopy(sink) { copyText() }
+        selection?.provideCopy(sink) { copyDump() }
     }
 
     @RequiresEdt
@@ -60,9 +112,13 @@ class TaskToolView(
         val follow = tailVisible()
         var changed = sync()
         changed = syncRows() || changed
+        changed = syncApprovalReason(approvalReasonsVisible()) || changed
         if (content.childTools.isNotEmpty() && !collapsed) changed = expand() || changed
         followTail(follow || fresh)
-        if (changed) refresh()
+        if (changed) {
+            refresh()
+            refreshPopup()
+        }
     }
 
     @RequiresEdt
@@ -98,6 +154,7 @@ class TaskToolView(
         changed = setFont(parts.sub, style.smallEditorFont) || changed
         changed = setFont(parts.state, style.smallEditorFont) || changed
         for (row in rows.values) changed = row.applyStyle(style) || changed
+        changed = footer.applyStyle(style) || changed
         if (changed) refresh()
     }
 
@@ -105,22 +162,71 @@ class TaskToolView(
     override fun getPreferredSize(): Dimension {
         val size = super.getPreferredSize()
         if (!bodyVisible()) return size
-        val height = row.preferredSize.height + expandedGap() + bodyMaxHeight()
+        val height = row.preferredSize.height + expandedGap() + bodyMaxHeight() + footerHeight()
         return Dimension(size.width, minOf(size.height, height))
+    }
+
+    @RequiresEdt
+    override fun syncApprovalReason(visible: Boolean): Boolean {
+        val changed = footer.update(item, visible)
+        if (changed) refresh()
+        return changed
     }
 
     private fun sync(): Boolean {
         var changed = false
         changed = syncExpandable(item.childTools.isNotEmpty()) || changed
         changed = setVisible(parts.state, item.childTools.isEmpty()) || changed
-        changed = setIcon(parts.glyph, icon(item)) || changed
-        changed = setForeground(parts.glyph, color(item)) || changed
+        changed = syncAvatar() || changed
         changed = setText(parts.title, agentTitle(item)) || changed
         changed = setText(parts.sub, summary(item)) || changed
         changed = setForeground(parts.title, titleColor(item)) || changed
         changed = setText(parts.state, stateText(item)) || changed
         changed = setForeground(parts.state, color(item)) || changed
+        changed = setVisible(promoteButton, canPromote(item)) || changed
+        changed = footer.update(item, approvalReasonsVisible()) || changed
         return changed
+    }
+
+    /**
+     * Generated per-subagent avatar (see [AgentAvatar]): the neutral unknown glyph before
+     * `childSessionId` is known, then a stable shape/hue keyed by that id. Running/pending shows the
+     * pulsing variant; completed/error settle on the same static glyph. Never tints through
+     * `parts.glyph.foreground` — the identity's color is baked into the icon itself.
+     */
+    @RequiresEdt
+    private fun syncAvatar(): Boolean {
+        val id = item.childSessionId ?: ""
+        val colorSlot = if (id.isEmpty()) null else avatarColor(id)
+        if (id != avatarId || colorSlot != avatarColorSlot) {
+            avatarId = id
+            avatarColorSlot = colorSlot
+            avatarStatic = AgentAvatar.static(id, colorSlot)
+            avatarRunning = AgentAvatar.running(id, colorSlot)
+        }
+        val running = item.state == ToolExecState.PENDING || item.state == ToolExecState.RUNNING
+        return setIcon(parts.glyph, if (running) avatarRunning else avatarStatic)
+    }
+
+    /**
+     * Visible only when the CLI allows background subagents and this is a running foreground task
+     * with a child session that is not already in the background. Without the capability check the
+     * button would be offered on a CLI whose kill switch is off, where promoting always fails.
+     */
+    private fun canPromote(tool: Tool): Boolean = onPromoteBackgroundAgent?.available() == true &&
+        tool.childSessionId != null &&
+        tool.state == ToolExecState.RUNNING &&
+        tool.metadata["background"] != "true"
+
+    private fun openSubagent() {
+        val id = item.childSessionId ?: return
+        val title = listOf(agentTitle(item), summary(item)).filter { it.isNotBlank() }.joinToString(" - ")
+        onOpenSubagent?.invoke(id, title)
+    }
+
+    private fun promoteBackgroundAgent() {
+        val id = item.childSessionId ?: return
+        onPromoteBackgroundAgent?.promote(id)
     }
 
     private fun syncRows(): Boolean {
@@ -148,8 +254,63 @@ class TaskToolView(
         if (changed) {
             body.rows.revalidate()
             body.rows.repaint()
+            body.revalidate()
+            body.repaint()
         }
         return changed
+    }
+
+    /**
+     * Collapsed-card hover preview. Unlike the edit/patch popups, which build fresh snapshot content,
+     * this hosts the *live* [TaskBodyScroll] — the same instance the in-place expanded card uses — so
+     * streaming child tools keep updating inside the popup while the card stays collapsed.
+     */
+    @RequiresEdt
+    override fun headerPopup(): HeaderPopupRequest? =
+        popup("tool", "task", item.childTools.isNotEmpty()) { taskPopupBody() }
+
+    @RequiresEdt
+    private fun taskPopupBody(): HeaderPopupBody {
+        val scroll = taskBody()
+        syncRows()
+        val owner = Disposer.newDisposable("Task popup body")
+        // The live body is only reparented into the popup, never rebuilt. On hide, detach it so it
+        // returns to a reusable state — unless the card already reclaimed it by expanding — and never
+        // dispose the shared component itself.
+        val body = HeaderPopupBody(
+            scroll,
+            owner,
+            SessionUiStyle.Colors.codeBlockBackground(),
+            SessionUiStyle.View.Popup.WIDE_MAX_WIDTH,
+            // Fixed, bounded box so streaming child tools scroll instead of resizing the balloon:
+            // a 60-char floor width, the shared height cap, and both scrollbars.
+            minWidth = scroll.getFontMetrics(style.smallEditorFont).charWidth('m') * POPUP_MIN_CHARS,
+            fixedHeight = true,
+            horizontal = true,
+        )
+        popup = body
+        Disposer.register(owner, Disposable {
+            if (popup === body) popup = null
+            if (!isExpanded()) detachBody(scroll)
+        })
+        return body
+    }
+
+    // The popup hosts the live body, so parent-view updates just revalidate it for the scrollbars to
+    // track the new content height; the balloon keeps its bounded size instead of resizing.
+    @RequiresEdt
+    private fun refreshPopup() {
+        val body = popup ?: return
+        body.component.revalidate()
+        body.component.repaint()
+    }
+
+    @RequiresEdt
+    private fun detachBody(scroll: TaskBodyScroll) {
+        val parent = scroll.parent ?: return
+        parent.remove(scroll)
+        parent.revalidate()
+        parent.repaint()
     }
 
     private fun taskBody() = bodyComponent() as TaskBodyScroll
@@ -205,7 +366,7 @@ class TaskToolView(
         return maxOf(0, view.height - scroll.viewport.extentSize.height)
     }
 
-    private fun copyText(): String = buildString {
+    private fun copyDump(): String = buildString {
         append(agentTitle(item))
         val desc = item.input["description"].orEmpty()
         if (desc.isNotBlank()) append(" - ").append(desc)
@@ -220,8 +381,8 @@ class TaskToolView(
     private class Row(tool: Tool) {
         private var item = tool
         val icon = JBLabel()
-        val title = JBLabel()
-        val sub = JBLabel().apply { foreground = SessionUiStyle.Text.Secondary.foreground() }
+        val title = PlainLabel()
+        val sub = PlainLabel().apply { foreground = SessionUiStyle.Text.Secondary.foreground() }
         val panel = JPanel(BorderLayout(UiStyle.Gap.md(), 0)).apply {
             isOpaque = false
             add(icon, BorderLayout.WEST)
@@ -256,6 +417,8 @@ class TaskToolView(
     override fun dumpLabel() = "TaskToolView#$contentId(${labelText()})"
 
     companion object {
+        private const val POPUP_MIN_CHARS = 60
+        private val CONTINUE_IN_BACKGROUND_ICON = IconLoader.getIcon("/icons/arrow-down-to-line.svg", TaskToolView::class.java)
         fun canRender(content: Tool): Boolean = content.name == "task"
     }
 }
@@ -266,7 +429,7 @@ private class TaskBody(glyph: JBLabel) {
         override fun updateUI() {
             super.updateUI()
             background = SessionUiStyle.Colors.codeBlockBackground()
-            border = taskBodyBorder(glyph)
+            border = toolBodyBorder(glyph)
         }
     }.apply {
         add(rows, BorderLayout.CENTER)
@@ -313,20 +476,6 @@ private fun rowTitleColor(tool: Tool) = if (tool.state == ToolExecState.ERROR) {
     UiStyle.Colors.errorLabelForeground()
 } else {
     SessionUiStyle.Text.Secondary.foreground()
-}
-
-private fun taskBodyBorder(glyph: JBLabel) = run {
-    val width = maxOf(
-        glyph.preferredSize.width,
-        glyph.icon?.iconWidth ?: 0,
-        JBUI.scale(SessionUiStyle.View.Layout.HORIZONTAL_PADDING),
-    )
-    JBUI.Borders.empty(
-        UiStyle.Gap.sm(),
-        width + JBUI.scale(SessionUiStyle.View.Layout.GAP) + UiStyle.Gap.md(),
-        UiStyle.Gap.sm(),
-        UiStyle.Gap.md(),
-    )
 }
 
 private fun agentTitle(tool: Tool): String {

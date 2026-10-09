@@ -1,10 +1,12 @@
 package ai.kilocode.client.session.views
 
+import ai.kilocode.client.session.AgentAvatar
 import ai.kilocode.client.session.model.Tool
 import ai.kilocode.client.session.model.ToolExecState
 import ai.kilocode.client.session.model.toolKind
 import ai.kilocode.client.session.ui.style.SessionUiStyle
 import ai.kilocode.client.session.views.tool.TaskToolView
+import ai.kilocode.client.ui.HoverIcon
 import ai.kilocode.client.ui.UiStyle
 import ai.kilocode.client.ui.layout.Stack
 import com.intellij.openapi.util.Disposer
@@ -16,7 +18,9 @@ import com.intellij.util.ui.UIUtil
 import java.awt.Component
 import java.awt.Container
 import java.awt.Color
+import java.awt.image.BufferedImage
 import javax.swing.JComponent
+import javax.swing.Icon
 import javax.swing.ScrollPaneConstants
 
 @Suppress("UnstableApiUsage")
@@ -100,6 +104,41 @@ class TaskToolViewTest : BasePlatformTestCase() {
         assertEquals(ScrollPaneConstants.VERTICAL_SCROLLBAR_AS_NEEDED, scroll.verticalScrollBarPolicy)
     }
 
+    fun `test task glyph shows the neutral identity before the child session id is known`() {
+        val view = view(task(sessionId = null))
+
+        assertPixelsEqual(AgentAvatar.static(""), glyph(view).icon)
+    }
+
+    fun `test different child sessions get different generated avatars`() {
+        val a = view(task(sessionId = "ses_aaa"))
+        val b = view(task(sessionId = "ses_bbb"))
+
+        assertFalse(pixels(glyph(a).icon).contentEquals(pixels(glyph(b).icon)))
+    }
+
+    fun `test avatar settles to the same static glyph once a running task finishes`() {
+        val view = view(running())
+        val runningIcon = glyph(view).icon
+
+        view.update(running().also { it.state = ToolExecState.COMPLETED })
+        val doneIcon = glyph(view).icon
+        assertNotSame(runningIcon, doneIcon)
+
+        // Re-applying the same terminal state reuses the retained static icon.
+        view.update(running().also { it.state = ToolExecState.COMPLETED })
+        assertSame(doneIcon, glyph(view).icon)
+    }
+
+    fun `test a supplied avatar color resolver changes the identity for the same child session`() {
+        val id = "ses_child"
+        val default = view(task(sessionId = id))
+        val colored = view(task(sessionId = id), avatarColor = { 3 })
+
+        assertPixelsEqual(AgentAvatar.static(id, 3), glyph(colored).icon)
+        assertFalse(pixels(glyph(default).icon).contentEquals(pixels(glyph(colored).icon)))
+    }
+
     fun `test child tool titles use target color`() {
         val view = view(task(children = listOf(child("c1", "read"), child("c2", "grep", ToolExecState.ERROR))))
 
@@ -146,13 +185,186 @@ class TaskToolViewTest : BasePlatformTestCase() {
         assertEquals(0, scroll.verticalScrollBar.value)
     }
 
-    private fun view(tool: Tool): TaskToolView = TaskToolView(tool).also { views.add(it) }
+    fun `test open subagent action is eligible only with child session and callback`() {
+        val closed = view(task(), onOpen = null)
+        val opened = view(task(), onOpen = { _, _ -> })
+        val missing = view(task(sessionId = null), onOpen = { _, _ -> })
 
-    private fun task(children: List<Tool> = emptyList()) = Tool("part_task", "task", toolKind("task")).also {
+        assertFalse(closed.copyEligible)
+        assertTrue(opened.copyEligible)
+        assertFalse(missing.copyEligible)
+    }
+
+    fun `test open subagent action invokes callback without toggling body`() {
+        val calls = mutableListOf<Pair<String, String>>()
+        val view = view(task(), onOpen = { id, title -> calls.add(id to title) })
+
+        openIcon(view).doClick()
+
+        assertEquals(listOf("ses_child" to "Explore Agent - Find files"), calls)
+        assertFalse(view.isExpanded())
+    }
+
+    fun `test continue in background is hidden when the CLI lacks the capability`() {
+        val off = view(running(), promote = BackgroundPromote({ false }, {}))
+
+        assertFalse(promoteIcon(off).isVisible)
+    }
+
+    fun `test continue in background shows for a running foreground task when capable`() {
+        val on = view(running(), promote = BackgroundPromote({ true }, {}))
+
+        assertTrue(promoteIcon(on).isVisible)
+    }
+
+    fun `test continue in background re-checks the capability on every update`() {
+        // The capability is only known after the connection load completes, so a card created before
+        // it arrives must pick it up rather than caching the value from construction.
+        var capable = false
+        val view = view(running(), promote = BackgroundPromote({ capable }, {}))
+        assertFalse(promoteIcon(view).isVisible)
+
+        capable = true
+        view.update(running())
+
+        assertTrue(promoteIcon(view).isVisible)
+    }
+
+    fun `test continue in background is hidden without a promote binding or for finished and background tasks`() {
+        val none = view(running(), promote = null)
+        val done = view(task(), promote = BackgroundPromote({ true }, {}))
+        val already = view(running(background = true), promote = BackgroundPromote({ true }, {}))
+
+        assertFalse(promoteIcon(none).isVisible)
+        assertFalse(promoteIcon(done).isVisible)
+        assertFalse(promoteIcon(already).isVisible)
+    }
+
+    fun `test continue in background promotes the child session`() {
+        val promoted = mutableListOf<String>()
+        val view = view(running(), promote = BackgroundPromote({ true }, { promoted.add(it) }))
+
+        promoteIcon(view).doClick()
+
+        assertEquals(listOf("ses_child"), promoted)
+    }
+
+    fun `test task popup only shows when collapsed with children`() {
+        val view = view(task(children = listOf(child("c1", "read"))))
+        assertTrue(view.isExpanded())
+        assertNull(view.headerPopup())
+
+        view.collapse()
+        assertNotNull(view.headerPopup())
+
+        val empty = view(task(children = emptyList()))
+        assertNull(empty.headerPopup())
+    }
+
+    fun `test collapsed task popup hosts the live expanded body`() {
+        val view = view(task(children = listOf(child("c1", "read"))))
+        val live = scroll(view)
+        assertNotNull(live)
+
+        view.collapse()
+        assertNull(scroll(view))
+
+        val popup = view.headerPopup()!!.build()
+        try {
+            // The popup hosts the same live scroll instance, not a rebuilt snapshot.
+            assertTrue(descendants(popup.component).any { it === live })
+        } finally {
+            Disposer.dispose(popup.disposable)
+        }
+
+        // Disposing the popup detaches the shared body without destroying it; re-expanding reuses it.
+        assertNull(live!!.parent)
+        view.expand()
+        assertSame(live, scroll(view))
+    }
+
+    fun `test collapsed task popup is a bounded scrollable box`() {
+        val view = view(task(children = children(40)))
+        view.collapse()
+
+        val popup = view.headerPopup()!!.build()
+        try {
+            // Fixed height cap, width bounded by the wide popup cap, and both scrollbars present so
+            // streaming content scrolls instead of resizing the balloon.
+            assertEquals(JBUI.scale(SessionUiStyle.View.Popup.MAX_HEIGHT), popup.component.preferredSize.height)
+            assertTrue(popup.component.preferredSize.width <= JBUI.scale(SessionUiStyle.View.Popup.WIDE_MAX_WIDTH))
+            val scrolls = descendants(popup.component).filterIsInstance<JBScrollPane>()
+            assertTrue(scrolls.any { it.horizontalScrollBarPolicy == ScrollPaneConstants.HORIZONTAL_SCROLLBAR_AS_NEEDED })
+            assertTrue(scrolls.any { it.verticalScrollBarPolicy == ScrollPaneConstants.VERTICAL_SCROLLBAR_AS_NEEDED })
+        } finally {
+            Disposer.dispose(popup.disposable)
+        }
+    }
+
+    fun `test collapsed task popup reflects streaming child updates`() {
+        val view = view(task(children = listOf(child("c1", "read"))))
+        val live = scroll(view)
+        view.collapse()
+
+        val popup = view.headerPopup()!!.build()
+        try {
+            assertEquals(1, popupRows(popup.component).size)
+            view.update(task(children = listOf(child("c1", "read"), child("c2", "grep"))))
+            assertEquals(2, popupRows(popup.component).size)
+        } finally {
+            Disposer.dispose(popup.disposable)
+        }
+
+        assertNull(live!!.parent)
+        view.expand()
+        assertSame(live, scroll(view))
+        assertEquals(2, rows(view).size)
+    }
+
+    fun `test open action reserves width even with a long summary`() {
+        val view = view(task(children = listOf(child("c1", "read")), description = "d".repeat(400)))
+        // A narrow header would starve a trailing child in the fill slot; the left group must not.
+        realize(view, JBUI.scale(320), JBUI.scale(160))
+
+        val anchor = view.copyAnchor
+        assertTrue(anchor.preferredSize.width > 0)
+        assertEquals(anchor.preferredSize.width, anchor.width)
+    }
+
+    private fun realize(component: Component, width: Int, height: Int) {
+        component.setSize(width, height)
+        if (component is Container) {
+            component.doLayout()
+            component.components.forEach { realize(it, it.width, it.height) }
+        }
+    }
+
+    private fun view(
+        tool: Tool,
+        onOpen: ((String, String) -> Unit)? = null,
+        promote: BackgroundPromote? = null,
+        avatarColor: (String) -> Int? = { null },
+    ): TaskToolView = TaskToolView(tool, onOpenSubagent = onOpen, onPromoteBackgroundAgent = promote, avatarColor = avatarColor)
+        .also { views.add(it) }
+
+    /** The task card's leading generated-avatar glyph: the one icon-only, text-less header label. */
+    private fun glyph(view: TaskToolView) = descendants(view).filterIsInstance<JBLabel>().first { it.text.isNullOrBlank() && it.icon != null }
+
+    /** A still-running foreground task — the only state "Continue in background" applies to. */
+    private fun running(background: Boolean = false) = task().also {
+        it.state = ToolExecState.RUNNING
+        if (background) it.metadata = it.metadata + mapOf("background" to "true")
+    }
+
+    private fun promoteIcon(view: TaskToolView) = descendants(view)
+        .filterIsInstance<HoverIcon>()
+        .first { it.toolTipText == "Continue in background" }
+
+    private fun task(children: List<Tool> = emptyList(), sessionId: String? = "ses_child", description: String = "Find files") = Tool("part_task", "task", toolKind("task")).also {
         it.state = ToolExecState.COMPLETED
-        it.input = mapOf("subagent_type" to "explore", "description" to "Find files")
-        it.metadata = mapOf("sessionId" to "ses_child")
-        it.childSessionId = "ses_child"
+        it.input = mapOf("subagent_type" to "explore", "description" to description)
+        it.metadata = sessionId?.let { id -> mapOf("sessionId" to id) }.orEmpty()
+        it.childSessionId = sessionId
         it.childTools = children
     }
 
@@ -171,6 +383,12 @@ class TaskToolViewTest : BasePlatformTestCase() {
         val stack = descendants(body(view)).filterIsInstance<Stack>().singleOrNull() ?: return emptyList()
         return stack.components.toList()
     }
+
+    // The open button is a hover overlay, not a header child, so read it from the copy toolbar.
+    private fun openIcon(view: TaskToolView) = view.copyToolbar as HoverIcon
+
+    private fun popupRows(component: Component): List<Component> =
+        descendants(component).filterIsInstance<Stack>().single().components.toList()
 
     private fun rowText(view: TaskToolView) = rows(view).map { row ->
         descendants(row).filterIsInstance<JBLabel>().mapNotNull { label -> label.text.takeIf { it.isNotBlank() } }.joinToString(" ")
@@ -194,5 +412,20 @@ class TaskToolViewTest : BasePlatformTestCase() {
     private fun assertColor(expected: Color, actual: Color?) {
         assertNotNull(actual)
         assertEquals(expected.rgb, actual!!.rgb)
+    }
+
+    private fun assertPixelsEqual(expected: Icon, actual: Icon) {
+        assertTrue(pixels(expected).contentEquals(pixels(actual)))
+    }
+
+    private fun pixels(icon: Icon): IntArray {
+        val image = BufferedImage(icon.iconWidth, icon.iconHeight, BufferedImage.TYPE_INT_ARGB)
+        val g = image.createGraphics()
+        try {
+            icon.paintIcon(null, g, 0, 0)
+        } finally {
+            g.dispose()
+        }
+        return image.getRGB(0, 0, image.width, image.height, null, 0, image.width)
     }
 }

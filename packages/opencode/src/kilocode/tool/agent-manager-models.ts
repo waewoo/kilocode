@@ -68,7 +68,7 @@ export const AgentManagerModelsTool = Tool.define<
   Effect.gen(function* () {
     const provider = yield* Provider.Service
     return {
-      description: DESCRIPTION,
+      description: `${DESCRIPTION}\n\nAlso use this tool before choosing model, provider, or variant for the task subagent tool. You may choose these settings to suit the subagent task without creating an Agent Manager session.`,
       parameters: Params,
       execute: (params) =>
         Effect.gen(function* () {
@@ -89,7 +89,7 @@ export const AgentManagerModelsTool = Tool.define<
               offset,
               total: matches.length,
               nextOffset,
-              hint: "Pass a model name (or one of its providers/IDs) as the agent_manager task `model`. Agent Manager picks the provider, preferring the one used by the current turn.",
+              hint: "Pass a model name as `model`, a listed provider ID as `provider`, and a supported reasoning effort as `variant` to task or agent_manager. Task selection does not create Agent Manager sessions.",
             }),
             metadata: { count: models.length, total: matches.length },
           }

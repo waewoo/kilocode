@@ -13,7 +13,9 @@ import java.awt.image.BufferedImage
 import javax.swing.Icon
 import javax.swing.JComponent
 import javax.swing.JLabel
+import javax.swing.JLayeredPane
 import javax.swing.JPanel
+import javax.swing.JRootPane
 
 @Suppress("UnstableApiUsage")
 class AbstractSessionPartViewTest : BasePlatformTestCase() {
@@ -87,6 +89,34 @@ class AbstractSessionPartViewTest : BasePlatformTestCase() {
         assertFalse(view.isExpanded())
         assertFalse(view.arrowVisible())
         assertNull(content.parent)
+    }
+
+    fun `test the arrow joins the header row only while the card can toggle`() {
+        val view = TestView(content = JLabel("body"))
+        val row = view.component(0) as JPanel
+        assertTrue(view.arrowAttached())
+
+        view.syncExpandable(false)
+
+        // Every tab switch walks the whole transcript tree, so a hidden arrow is not kept attached.
+        assertFalse(view.arrowAttached())
+        assertFalse(view.arrowVisible())
+
+        view.syncExpandable(true)
+        view.toggle()
+
+        assertTrue(view.arrowAttached())
+        assertSame(row, view.arrowParent())
+        assertTrue(view.isExpanded())
+        assertEquals(Cursor.HAND_CURSOR, view.arrowCursor())
+    }
+
+    fun `test a fixed non expandable card never attaches the arrow`() {
+        val view = TestView(content = JLabel("body"), expandable = false)
+
+        view.syncExpandable(true)
+
+        assertFalse(view.arrowAttached())
     }
 
     fun `test expandable card header shows the hand cursor`() {
@@ -193,6 +223,45 @@ class AbstractSessionPartViewTest : BasePlatformTestCase() {
         assertEquals(SessionUiStyle.View.Surface.headerBgColor().rgb, row.background.rgb)
     }
 
+    fun `test hover survives an exit that stays on the row`() {
+        val view = NestedView(JLabel("link"))
+        val row = view.component(0) as JPanel
+        pane(view)
+
+        enter(row)
+        // Swing reports an exit for every nested crossing; one that lands back on the row is not a
+        // leave, so the fill must stay.
+        exit(row, 5, 5)
+
+        assertEquals(SessionUiStyle.View.Surface.headerHoverBgColor().rgb, row.background.rgb)
+    }
+
+    fun `test hover clears when an overlay covers the row under the pointer`() {
+        val view = NestedView(JLabel("link"))
+        val row = view.component(0) as JPanel
+        val pane = pane(view)
+        enter(row)
+        assertEquals(SessionUiStyle.View.Surface.headerHoverBgColor().rgb, row.background.rgb)
+
+        // A banner painted above the transcript owns the pointer even while it sits inside the row's
+        // bounds, so the row must not stay lit underneath it.
+        pane.add(JPanel().apply { setBounds(0, 0, 200, 40) }, JLayeredPane.PALETTE_LAYER)
+        exit(row, 5, 5)
+
+        assertEquals(SessionUiStyle.View.Surface.headerBgColor().rgb, row.background.rgb)
+    }
+
+    private fun pane(view: AbstractSessionPartView): JLayeredPane {
+        val root = JRootPane()
+        root.setSize(200, 40)
+        root.contentPane.add(view)
+        view.setSize(200, 40)
+        view.doLayout()
+        root.doLayout()
+        root.contentPane.doLayout()
+        return root.layeredPane
+    }
+
     fun `test clicking a nested header child toggles the card`() {
         val child = JLabel("plain")
         val header = JPanel(BorderLayout()).apply { add(child, BorderLayout.WEST) }
@@ -232,6 +301,9 @@ class AbstractSessionPartViewTest : BasePlatformTestCase() {
         override fun update(content: Content) {}
         fun arrowVisible() = arrow.isVisible
         fun arrowIcon(): Icon = arrow.icon
+        fun arrowAttached() = arrow.parent === row
+        fun arrowParent(): Component? = arrow.parent
+        fun arrowCursor() = arrow.cursor.type
     }
 
     private class NestedView(header: JComponent) : AbstractSessionPartView(header, JLabel("body")) {

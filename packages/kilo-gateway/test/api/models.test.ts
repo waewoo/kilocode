@@ -1,6 +1,6 @@
 // Verifies fetchKiloModels typed result and 401 fallback behaviour.
 
-import { test, expect } from "bun:test"
+import { test, expect, spyOn } from "bun:test"
 import { fetchKiloModels, fetchKiloTranscriptionModels } from "../../src/api/models.js"
 
 const VALID_RESPONSE = JSON.stringify({
@@ -84,6 +84,32 @@ function stubFetch(fn: (input: string | URL | Request, init?: RequestInit) => Pr
   ;(globalThis as any).fetch = fn
 }
 
+for (const status of [408, 429, 503]) {
+  for (const [header, expected] of [
+    ["90", 90],
+    ["Thu, 01 Jan 1970 00:02:00 GMT", 120],
+    ["invalid", undefined],
+    [undefined, undefined],
+  ] as const) {
+    test(`preserves valid Retry-After from HTTP ${status}: ${header}`, async () => {
+      const clock = spyOn(Date, "now").mockReturnValue(0)
+      const fetch = spyOn(globalThis, "fetch").mockResolvedValue(
+        new Response("Unavailable", { status, headers: header == null ? {} : { "retry-after": header } }),
+      )
+      try {
+        const result = await fetchKiloModels({ kilocodeOrganizationId: "org-a" })
+        expect(result.error?.kind).toBe("http")
+        expect(result.error?.status).toBe(status)
+        expect(result.error?.retryAfter).toBe(expected)
+        expect(fetch).toHaveBeenCalledTimes(1)
+      } finally {
+        fetch.mockRestore()
+        clock.mockRestore()
+      }
+    })
+  }
+}
+
 test("returns empty models and error when both auth and public requests return 401", async () => {
   const orig = globalThis.fetch
   stubFetch(async () => new Response("Unauthorized", { status: 401, statusText: "Unauthorized" }))
@@ -113,7 +139,6 @@ test("falls back to public endpoint on 401 and returns models", async () => {
 
   const result = await fetchKiloModels({
     kilocodeToken: "expired-token",
-    kilocodeOrganizationId: "org-123",
   })
 
   ;(globalThis as any).fetch = orig
@@ -121,6 +146,36 @@ test("falls back to public endpoint on 401 and returns models", async () => {
   expect(callCount).toBe(2)
   expect(result.error).toBeUndefined()
   expect(Object.keys(result.models).length).toBeGreaterThan(0)
+})
+
+test.each([
+  { kilocodeToken: "expired-token", kilocodeOrganizationId: "org-123" },
+  { kilocodeOrganizationId: "org-123" },
+  { kilocodeToken: "expired-token", baseURL: "https://api.kilo.ai/api/organizations/org-123" },
+  { kilocodeToken: "expired-token", baseURL: "https://gateway.test/api/organizations/org-123" },
+  { kilocodeToken: "https://gateway.test/api/organizations/org-token:expired-token" },
+  {
+    kilocodeToken: "https://gateway.test/api/organizations/org-token:expired-token",
+    baseURL: "https://api.kilo.ai/api/openrouter",
+  },
+])("never retries an organization-scoped 401 against the public catalog: %j", async (options) => {
+  const fetch = spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 401 }))
+  try {
+    expect(await fetchKiloModels(options)).toEqual({ models: {}, error: { kind: "unauthorized", status: 401 } })
+    expect(fetch).toHaveBeenCalledTimes(1)
+  } finally {
+    fetch.mockRestore()
+  }
+})
+
+test("preserves a successful empty organization catalog", async () => {
+  const fetch = spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ data: [] }))
+  try {
+    expect(await fetchKiloModels({ kilocodeToken: "token", kilocodeOrganizationId: "org-123" })).toEqual({ models: {} })
+    expect(fetch).toHaveBeenCalledTimes(1)
+  } finally {
+    fetch.mockRestore()
+  }
 })
 
 test("returns error with kind=network on fetch exception", async () => {
@@ -306,6 +361,25 @@ const MIXED_MODALITY_RESPONSE = JSON.stringify({
       },
       supported_parameters: ["tools", "temperature"],
     },
+    {
+      id: "typesafe/jev-router",
+      name: "Jev Router",
+      context_length: 128000,
+      architecture: {
+        input_modalities: ["text"],
+        output_modalities: ["text"],
+      },
+      supported_parameters: [],
+    },
+    {
+      id: "test/no-params",
+      name: "No Params Model",
+      context_length: 128000,
+      architecture: {
+        input_modalities: ["text"],
+        output_modalities: ["text"],
+      },
+    },
   ],
 })
 
@@ -329,6 +403,8 @@ test("keeps image-output models with tools and drops models without tools", asyn
   expect(result.models["black-forest-labs/flux-1.1-pro"]).toBeDefined()
   expect(result.models["test/model-a"]).toBeDefined()
   expect(result.models["test/no-tools"]).toBeUndefined()
+  expect(result.models["typesafe/jev-router"]?.tool_call).toBe(true)
+  expect(result.models["test/no-params"]?.tool_call).toBe(true)
 })
 
 test("fetches and filters the transcription catalog", async () => {
@@ -445,4 +521,3 @@ test("omits cost when pricing contains negative values (dynamic/auto-routed pric
     cache_read: 0.3,
   })
 })
-

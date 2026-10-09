@@ -5,6 +5,7 @@ import ai.kilocode.client.session.SessionFileOpener
 import ai.kilocode.client.session.views.base.GenericView
 import ai.kilocode.client.session.views.base.PartView
 import ai.kilocode.client.session.views.question.QuestionResultView
+import ai.kilocode.client.session.views.tool.BoardToolView
 import ai.kilocode.client.session.views.tool.EditToolView
 import ai.kilocode.client.session.views.tool.GlobToolView
 import ai.kilocode.client.session.views.tool.ReadToolView
@@ -52,6 +53,13 @@ object ViewFactory {
         openAttachment: (FileAttachment) -> Unit = { AttachmentView.openDefault(it, openFile, openUrl) },
         openDiff: SessionDiffOpener = { _, _, _ -> },
         sessionId: String? = null,
+        onOpenSubagent: ((String, String) -> Unit)? = null,
+        // avatarColor sits before onPromoteBackgroundAgent (not after) so this overload's last
+        // parameter stays a non-function type: if a lambda type were last here, a trailing-lambda
+        // call meant for the exact-arity `create(content, openFile, openUrl)` overload above would
+        // also become applicable to this one, making every such call site ambiguous.
+        avatarColor: (String) -> Int? = { null },
+        onPromoteBackgroundAgent: BackgroundPromote? = null,
     ): PartView = when (content) {
         is Text -> TextView(content, openFile = openFile, openUrl = openUrl, selection = selection)
         is Reasoning -> ReasoningView(content, openFile = openFile, openUrl = openUrl, selection = selection)
@@ -65,7 +73,14 @@ object ViewFactory {
             SearchToolView.canRender(content) -> SearchToolView(content, selection = selection, repo = repo)
             ReadToolView.canRender(content) -> ReadToolView(content, openFile, selection = selection)
             EditToolView.canRender(content) -> EditToolView(content, openFile, selection, openDiff, sessionId)
-            TaskToolView.canRender(content) -> TaskToolView(content, selection = selection)
+            TaskToolView.canRender(content) -> TaskToolView(
+                content,
+                selection = selection,
+                onOpenSubagent = onOpenSubagent,
+                onPromoteBackgroundAgent = onPromoteBackgroundAgent,
+                avatarColor = avatarColor,
+            )
+            BoardToolView.canRender(content) -> BoardToolView(content, selection = selection)
             else -> ToolView(content, selection = selection)
         }
         is Compaction -> CompactionView(content)
@@ -94,9 +109,16 @@ object ViewFactory {
         openAttachment: (FileAttachment) -> Unit = { AttachmentView.openDefault(it, openFile, openUrl) },
         openDiff: SessionDiffOpener = { _, _, _ -> },
         sessionId: String? = null,
+        onOpenSubagent: ((String, String) -> Unit)? = null,
+        // See the matching comment on `create`: keep this last parameter a non-function type.
+        avatarColor: (String) -> Int? = { null },
+        onPromoteBackgroundAgent: BackgroundPromote? = null,
     ): PartView = when (content) {
         is Text -> PromptView(content, openFile = openFile, openAttachment = openAttachment, openUrl = openUrl, selection = selection, mentions = mentions)
-        else -> create(content, openFile, openUrl, selection, repo, openAttachment, openDiff, sessionId)
+        else -> create(
+            content, openFile, openUrl, selection, repo, openAttachment, openDiff, sessionId,
+            onOpenSubagent = onOpenSubagent, avatarColor = avatarColor, onPromoteBackgroundAgent = onPromoteBackgroundAgent,
+        )
     }
 
     /**
@@ -123,6 +145,8 @@ object ViewFactory {
         if (view is ToolView && EditToolView.canRender(content)) return true
         if (view is TaskToolView) return !TaskToolView.canRender(content) || QuestionResultView.canRender(content)
         if (view !is TaskToolView && TaskToolView.canRender(content)) return true
+        if (view is BoardToolView) return !BoardToolView.canRender(content) || QuestionResultView.canRender(content)
+        if (view is ToolView && BoardToolView.canRender(content)) return true
         if (view is ToolView) return QuestionResultView.canRender(content)
         return false
     }

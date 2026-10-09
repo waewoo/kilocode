@@ -1,57 +1,90 @@
 package ai.kilocode.client.agentManager.worktree
 
 import ai.kilocode.client.KiloNotifications
+import ai.kilocode.client.actions.reloadCoreSettings
 import ai.kilocode.client.app.KiloAppService
 import ai.kilocode.client.app.KiloWorkspaceService
 import ai.kilocode.client.plugin.KiloBundle
+import ai.kilocode.client.plugin.KiloPluginSettings
+import ai.kilocode.client.session.controller.key
+import ai.kilocode.client.session.controller.resolveSessionAgent
+import ai.kilocode.client.session.controller.resolveSessionDefaultModel
+import ai.kilocode.client.session.controller.resolveSessionModel
 import ai.kilocode.client.session.ui.ReasoningPicker
 import ai.kilocode.client.session.ui.mode.modeItems
 import ai.kilocode.client.session.ui.model.ModelPicker
 import ai.kilocode.client.session.ui.model.modelItems
 import ai.kilocode.client.session.ui.prompt.KiloPromptCompletionProvider
 import ai.kilocode.client.session.ui.prompt.MentionAction
-import ai.kilocode.client.session.ui.prompt.PromptFuzzyRanker
 import ai.kilocode.client.session.ui.prompt.PromptPanel
 import ai.kilocode.client.session.ui.prompt.SlashAction
+import ai.kilocode.client.settings.base.BaseContentPanel
+import ai.kilocode.client.settings.base.SettingsRows
+import ai.kilocode.client.settings.base.SettingsStackedRow
 import ai.kilocode.client.ui.UiStyle
 import ai.kilocode.client.ui.layout.Stack
+import ai.kilocode.rpc.dto.KiloAppStatusDto
+import ai.kilocode.rpc.dto.ModelSelectionDto
 import ai.kilocode.rpc.dto.ModelsWorkspaceDto
+import ai.kilocode.rpc.foreignPr
+import ai.kilocode.rpc.parsePrUrl
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.components.service
 import com.intellij.openapi.project.Project
-import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.ui.DialogWrapper
-import com.intellij.ui.DocumentAdapter
 import com.intellij.ui.components.JBTextField
+import com.intellij.ui.tabs.JBTabs
+import com.intellij.ui.tabs.JBTabsFactory
+import com.intellij.ui.tabs.JBTabsPosition
+import com.intellij.ui.tabs.TabInfo
+import com.intellij.ui.tabs.TabsListener
 import com.intellij.util.ui.FormBuilder
 import com.intellij.util.ui.JBUI
+import com.intellij.util.ui.components.BorderLayoutPanel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 import java.awt.Component
 import java.awt.GridBagConstraints
-import java.awt.event.FocusAdapter
-import java.awt.event.FocusEvent
-import javax.swing.ComboBoxModel
-import javax.swing.DefaultComboBoxModel
 import javax.swing.JComponent
-import javax.swing.JTextField
-import javax.swing.event.DocumentEvent
-import javax.swing.plaf.basic.BasicComboPopup
 
-private const val NAME_COLUMNS = 100
+private const val NAME_COLUMNS = 67
+
+/** What the user confirmed in the New Worktree dialog. */
+sealed interface NewWorktreePlan {
+    data class Create(val branch: String, val base: String?, val prompt: PendingPrompt?) : NewWorktreePlan
+    data class Branch(val branch: String) : NewWorktreePlan
+    data class Pr(val url: String) : NewWorktreePlan
+}
 
 /**
- * New Worktree dialog with parity to the VS Code Agent Manager dialog: a worktree name (top), an
- * initial prompt with the same mode / model / reasoning pickers as the chat prompt (center), and the
- * branch name + base branch (bottom). Creating a worktree starts a session automatically with the
- * prompt.
+ * The New Worktree dialog as seen by its caller: show it, then read what the user confirmed.
+ * [result] stays null while the dialog is cancelled or its input never validates.
+ */
+interface NewWorktreeHandle {
+    fun showAndGet(): Boolean
+    fun result(): NewWorktreePlan?
+}
+
+/**
+ * New Worktree dialog with parity to the VS Code Agent Manager dialog, split into three tabs:
  *
- * The dialog performs no worktree work itself — it invokes [onCreate] and closes; the panel drives
- * the controller. Mode, model, and reasoning selections are persisted the same way the chat prompt
+ * - **New** creates a branch: a worktree name (top), an initial prompt with the same mode / model /
+ *   reasoning pickers as the chat prompt (center), and the branch name + base branch (bottom).
+ *   Creating a worktree starts a session automatically with the prompt.
+ * - **From PR** checks out a GitHub pull request by URL.
+ * - **From Branch** checks out a local branch that no worktree holds yet.
+ *
+ * Both import tabs carry no initial prompt, so the worktree opens with an empty session. The
+ * selected tab alone decides which input the OK button acts on.
+ *
+ * The dialog performs no worktree work itself — it records the confirmed [result] and closes; the
+ * panel then drives the controller, so no view switch or worktree work runs while the modal dialog
+ * still owns focus. Mode, model, and reasoning selections are persisted the same way the chat prompt
  * does, so the freshly-started session inherits them.
  */
 internal class NewWorktreeDialog(
@@ -61,14 +94,16 @@ internal class NewWorktreeDialog(
     private val suggestedName: String,
     private val defaultBase: String,
     private val branches: List<String>,
-    private val onCreate: (branch: String, base: String?, prompt: PendingPrompt?) -> Unit,
+    // `owner/repo` for the checkout's origin remote; null when there is no GitHub origin. Used to
+    // reject a pull request URL that belongs to a different repository before it is ever fetched.
+    private val origin: String? = null,
     private val app: KiloAppService = service(),
     private val workspaces: KiloWorkspaceService = service(),
-) : DialogWrapper(parent, false) {
+) : DialogWrapper(parent, false), NewWorktreeHandle {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
-    // A wide name field so the dialog opens wide enough to type long worktree names and prompts.
+    // Sizes the dialog: the name field is its widest fixed-width child.
     private val name = JBTextField(NAME_COLUMNS).apply {
         emptyText.text = KiloBundle.message("worktree.dialog.name.placeholder")
     }
@@ -91,13 +126,14 @@ internal class NewWorktreeDialog(
         showEnhance = false,
     )
     private val branch = JBTextField(suggestedName)
-    private val bases = baseBranches(branches, defaultBase)
-    private val baseSet = bases.toSet()
-    private val base = ComboBox(baseModel(bases)).apply {
-        isEditable = true
-        selectedItem = defaultBase
+    private val base = BranchPicker(branches, defaultBase)
+    private val url = JBTextField().apply {
+        emptyText.text = KiloBundle.message("worktree.import.pr.placeholder")
     }
-    private var syncing = false
+    private val pick = BranchPicker(branches)
+    private var tab = DialogTab.NEW
+
+    private var plan: NewWorktreePlan? = null
 
     /** The agent (mode) for the new session; model selections persist against it. */
     private var agent: String? = null
@@ -108,28 +144,37 @@ internal class NewWorktreeDialog(
     /** The loaded catalog, so mode changes can re-point the model picker without a reload. */
     private var items: List<ModelPicker.Item> = emptyList()
 
+    /** The directory-scoped providers and agents used by normal-session selection resolution. */
+    private var workspace: ModelsWorkspaceDto? = null
+
+    /** The reasoning effort currently displayed by the picker. */
+    private var variant: String? = null
+
     @Volatile
     private var disposed = false
 
     private var center: JComponent? = null
 
     init {
-        wireBase()
+        if (pick.empty) pick.isEnabled = false
         title = KiloBundle.message("worktree.configure.title")
         init()
         setOKButtonText(KiloBundle.message("worktree.dialog.create"))
     }
 
-    override fun createCenterPanel(): JComponent = content().also { center = it }
+    override fun createCenterPanel(): JComponent = tabs().also { center = it }
 
     /** The built content, so tests can drive the real Swing tree before the dialog is shown. */
     internal fun centerComponent(): JComponent = center ?: error("center panel not built")
 
-    override fun getPreferredFocusedComponent(): JComponent = prompt.defaultFocusedComponent
+    override fun result(): NewWorktreePlan? = plan
 
-    override fun getDimensionServiceKey(): String = "ai.kilocode.NewWorktreeDialog"
+    override fun getPreferredFocusedComponent(): JComponent = focus()
 
-    override fun doOKAction() = submitCreate()
+    // Versioned: DialogWrapper persists the size per key, so a stale entry would keep the old width.
+    override fun getDimensionServiceKey(): String = "ai.kilocode.NewWorktreeDialog.v3"
+
+    override fun doOKAction() = submit()
 
     override fun dispose() {
         disposed = true
@@ -137,14 +182,81 @@ internal class NewWorktreeDialog(
         super.dispose()
     }
 
-    private fun content(): JComponent {
+    internal fun submit() {
+        setErrorText(null)
+        when (tab) {
+            DialogTab.PR -> submitPr()
+            DialogTab.BRANCH -> submitBranch()
+            DialogTab.NEW -> submitCreate()
+        }
+    }
+
+    private fun tabs(): JComponent {
+        val fresh = TabInfo(newContent()).setText(KiloBundle.message("worktree.dialog.tab.new"))
+        // Importing a PR needs gh, which is exactly what the GitHub integration setting turns off,
+        // so the tab is omitted rather than offered as a guaranteed failure.
+        val pr = if (KiloPluginSettings.getGithub()) TabInfo(prContent()).setText(KiloBundle.message("worktree.dialog.tab.pr")) else null
+        val local = TabInfo(branchContent()).setText(KiloBundle.message("worktree.dialog.tab.branch"))
+        val tabs: JBTabs = JBTabsFactory.createTabs(project, disposable).apply {
+            presentation.setSingleRow(true)
+            presentation.setTabsPosition(JBTabsPosition.top)
+            presentation.showBorder = false
+            addTab(fresh).setPreferredFocusableComponent(prompt.defaultFocusedComponent)
+            pr?.let { addTab(it).setPreferredFocusableComponent(url) }
+            addTab(local).setPreferredFocusableComponent(pick)
+            addListener(object : TabsListener {
+                override fun beforeSelectionChanged(oldSelection: TabInfo?, newSelection: TabInfo?) {
+                    // JBTabs defers removing the old body while focus settles, and that body keeps
+                    // its previous bounds. Hide it before layout so stale content cannot paint over
+                    // the newly selected tab.
+                    newSelection?.component?.isVisible = true
+                    oldSelection?.component?.isVisible = false
+                }
+
+                override fun selectionChanged(oldSelection: TabInfo?, newSelection: TabInfo?) {
+                    tab = when {
+                        newSelection === pr -> DialogTab.PR
+                        newSelection === local -> DialogTab.BRANCH
+                        else -> DialogTab.NEW
+                    }
+                    setOKButtonText(KiloBundle.message(if (tab == DialogTab.NEW) "worktree.dialog.create" else "worktree.dialog.import"))
+                    ui { focus().requestFocusInWindow() }
+                }
+            }, disposable)
+        }
+        return tabs.component
+    }
+
+    private fun newContent(): JComponent {
         wirePickers()
+        watchModels()
         loadModels()
         return Stack.vertical(gap = UiStyle.Gap.pad())
             .next(name)
             .next(prompt)
             .next(fields())
             .apply { border = JBUI.Borders.empty(UiStyle.Gap.sm()) }
+    }
+
+    private fun prContent(): JComponent = importContent(SettingsStackedRow(
+        KiloBundle.message("worktree.import.pr.section"),
+        description = KiloBundle.message("worktree.import.pr.description"),
+        value = url,
+    ))
+
+    private fun branchContent(): JComponent = importContent(SettingsStackedRow(
+        KiloBundle.message("worktree.import.branch.section"),
+        description = KiloBundle.message(if (pick.empty) "worktree.import.branch.empty" else "worktree.import.branch.description"),
+        value = pick,
+    ))
+
+    private fun importContent(row: JComponent): JComponent {
+        val body = BaseContentPanel().apply {
+            border = JBUI.Borders.empty(UiStyle.Gap.pad(), UiStyle.Gap.sm(), UiStyle.Gap.pad(), UiStyle.Gap.sm())
+        }
+        body.next(SettingsRows().row(row))
+        // Pinned to the top: the import forms are shorter than the New tab, which sizes the dialog.
+        return BorderLayoutPanel().apply { addToTop(body) }
     }
 
     // A FormBuilder that stretches every field to the full width, so the base-branch combo matches
@@ -164,8 +276,18 @@ internal class NewWorktreeDialog(
             modelKey = item.key
             agent?.let { app.selectModel(it, item.provider, item.id) }
             syncReasoning(item)
+            prompt.setAttachmentEnabled(item.attachment)
         }
-        prompt.reasoning.onSelect = { item -> modelKey?.let { app.selectVariant(it, item.id) } }
+        prompt.reasoning.onSelect = { item ->
+            variant = item.id
+            modelKey?.let { app.selectVariant(it, item.id) }
+        }
+    }
+
+    private fun watchModels() {
+        scope.launch {
+            combine(app.state, app.models) { _, _ -> Unit }.collect { ui(::syncSelection) }
+        }
     }
 
     private fun loadModels() {
@@ -176,19 +298,15 @@ internal class NewWorktreeDialog(
     }
 
     private fun applyModels(ws: ModelsWorkspaceDto) {
+        workspace = ws
         items = modelItems(ws.providers)
-        agent = ws.agents?.default
+        agent = resolveSessionAgent(ws.agents, KiloPluginSettings.getAgent())
         prompt.mode.setItems(modeItems(ws.agents?.agents), agent)
         if (items.isEmpty()) {
             prompt.setReady(true)
             return
         }
-        val saved = agent?.let { app.models.value.model[it] }?.let { "${it.providerID}/${it.modelID}" }
-        prompt.model.setItems(items, saved)
-        val current = items.firstOrNull { it.key == saved } ?: items.first()
-        modelKey = current.key
-        syncReasoning(current)
-        prompt.setAttachmentEnabled(current.attachment)
+        syncSelection()
         prompt.setReady(true)
     }
 
@@ -197,112 +315,104 @@ internal class NewWorktreeDialog(
         // longer writes default_agent to the global config here — doing so changed the mode for
         // every other workspace and raced the new session's own model load.
         agent = id
-        val saved = app.models.value.model[id]?.let { "${it.providerID}/${it.modelID}" }
-        if (saved != null && items.any { it.key == saved }) {
-            prompt.model.select(saved)
-            modelKey = saved
+        syncSelection()
+    }
+
+    private fun syncSelection() {
+        val ws = workspace ?: return
+        val first = items.firstOrNull() ?: return
+        val id = agent
+        val current = if (id == null) {
+            first
+        } else {
+            val state = app.models.value
+            val cfg = app.state.value
+            val fallback = resolveSessionDefaultModel(
+                providers = ws.providers,
+                agent = id,
+                state = state,
+                config = cfg.config,
+                ready = cfg.status == KiloAppStatusDto.READY,
+                first = ModelSelectionDto(first.provider, first.id),
+            )
+            val selection = resolveSessionModel(ws.providers, id, state, cfg.config, fallback)
+            items.firstOrNull { it.key == selection?.key } ?: first
         }
-        items.firstOrNull { it.key == modelKey }?.let { syncReasoning(it) }
+        prompt.model.setItems(items, current.key)
+        modelKey = current.key
+        syncReasoning(current)
+        prompt.setAttachmentEnabled(current.attachment)
     }
 
     private fun syncReasoning(item: ModelPicker.Item) {
+        val saved = app.models.value.variant[item.key]?.takeIf { it in item.variants }
+        variant = saved ?: item.variants.firstOrNull()
         prompt.reasoning.setItems(
             item.variants.map { ReasoningPicker.Item(it, variantTitle(it)) },
-            app.models.value.variant[item.key],
+            variant,
         )
-    }
-
-    private fun wireBase() {
-        val field = baseField() ?: return
-        field.document.addDocumentListener(object : DocumentAdapter() {
-            override fun textChanged(e: DocumentEvent) {
-                if (!syncing) syncBase(field.text, popup = true)
-            }
-        })
-        field.addFocusListener(object : FocusAdapter() {
-            override fun focusLost(e: FocusEvent) {
-                restoreBase()
-            }
-        })
-    }
-
-    private fun restoreBase() {
-        if (baseText().isNotEmpty() || defaultBase.isBlank()) return
-        setBase(defaultBase)
-    }
-
-    private fun syncBase(text: String, popup: Boolean) {
-        val value = text.trim()
-        if (value.isEmpty()) return
-        if (popup && base.isShowing && !base.isPopupVisible) {
-            base.isPopupVisible = true
-        }
-        val idx = matchBase(value) ?: return
-        val list = popupList() ?: return
-        if (list.selectedIndex != idx) list.selectedIndex = idx
-        list.ensureIndexIsVisible(idx)
-    }
-
-    private fun matchBase(text: String): Int? {
-        val rank = PromptFuzzyRanker(text)
-        return bases.withIndex().mapNotNull { item ->
-            rank.score(item.value, emptyList())?.let { score -> item.index to score }
-        }.maxByOrNull { it.second }?.first
-    }
-
-    private fun popupList() = (base.accessibleContext?.getAccessibleChild(0) as? BasicComboPopup)?.list
-
-    private fun baseField() = base.editor.editorComponent as? JTextField
-
-    private fun baseText() = baseField()?.text?.trim()
-        ?: base.editor.item?.toString()?.trim().orEmpty()
-
-    private fun setBase(value: String) {
-        syncing = true
-        try {
-            base.selectedItem = value
-            baseField()?.text = value
-        } finally {
-            syncing = false
-        }
-    }
-
-    private fun resolvedBase(): String? {
-        val value = baseText()
-        if (value.isEmpty()) {
-            val fallback = defaultBase.trim()
-            if (fallback.isNotEmpty()) setBase(fallback)
-            return fallback.takeIf { it.isNotEmpty() }
-        }
-        if (value in baseSet) return value
-        val idx = matchBase(value) ?: return value
-        val target = bases[idx]
-        setBase(target)
-        return target
     }
 
     private fun validBase(value: String?): Boolean {
-        if (value == null || value in baseSet) return true
+        if (base.known(value)) return true
         KiloNotifications.error(
             project,
             KiloBundle.message("worktree.configure.base.invalid.title"),
-            KiloBundle.message("worktree.configure.base.invalid.content", value),
+            KiloBundle.message("worktree.configure.base.invalid.content", value.orEmpty()),
         )
-        baseField()?.apply {
-            requestFocusInWindow()
-            selectAll()
-        }
-        syncBase(value, popup = true)
+        base.focusText()
         return false
     }
 
     private fun submitCreate(text: String = prompt.text()) {
         val explicit = branch.text.trim()
         val resolved = explicit.ifEmpty { name.text.trim() }.ifEmpty { suggestedName }
-        val target = resolvedBase()
+        val target = base.resolve()
         if (!validBase(target)) return
-        onCreate(resolved, target, pending(text))
+        plan = NewWorktreePlan.Create(resolved, target, pending(text))
         close(OK_EXIT_CODE)
+    }
+
+    private fun submitPr() {
+        val value = url.text.trim()
+        if (value.isEmpty()) {
+            setErrorText(KiloBundle.message("worktree.import.pr.required"), url)
+            url.requestFocusInWindow()
+            return
+        }
+        val ref = parsePrUrl(value)
+        if (ref == null) {
+            setErrorText(KiloBundle.message("worktree.import.pr.invalid"), url)
+            url.requestFocusInWindow()
+            url.selectAll()
+            return
+        }
+        val slug = "${ref.owner}/${ref.repo}"
+        if (foreignPr(slug, origin)) {
+            setErrorText(KiloBundle.message("worktree.import.pr.foreign", slug, origin.orEmpty()), url)
+            url.requestFocusInWindow()
+            url.selectAll()
+            return
+        }
+        plan = NewWorktreePlan.Pr(value)
+        close(OK_EXIT_CODE)
+    }
+
+    private fun submitBranch() {
+        val target = pick.resolve()
+        if (target == null || !pick.known(target)) {
+            setErrorText(KiloBundle.message("worktree.import.branch.invalid"), pick)
+            pick.focusText()
+            return
+        }
+        plan = NewWorktreePlan.Branch(target)
+        close(OK_EXIT_CODE)
+    }
+
+    private fun focus(): JComponent = when (tab) {
+        DialogTab.PR -> url
+        DialogTab.BRANCH -> pick
+        DialogTab.NEW -> prompt.defaultFocusedComponent
     }
 
     /** Bundles the typed prompt with the picked mode / model / reasoning, or null when empty. */
@@ -315,7 +425,7 @@ internal class NewWorktreeDialog(
             agent = agent,
             provider = item?.provider,
             model = item?.id,
-            variant = modelKey?.let { app.models.value.variant[it] },
+            variant = variant,
         )
     }
 
@@ -331,6 +441,7 @@ internal class NewWorktreeDialog(
             SlashAction.MODELS to { prompt.model.open() },
             SlashAction.AGENTS to { prompt.mode.open() },
             SlashAction.VARIANT to { prompt.reasoning.open() },
+            SlashAction.RELOAD to { reloadCoreSettings(workspaces, directory, project, "slash_command") },
         )
         return SlashAction.ALL.map { spec ->
             SlashAction(spec.name, KiloBundle.message(spec.descriptionKey), spec.hints, actions[spec] ?: {})
@@ -344,16 +455,7 @@ internal class NewWorktreeDialog(
         spec.available,
     )
 
-    private fun baseBranches(branches: List<String>, default: String): List<String> {
-        val ordered = LinkedHashSet<String>()
-        if (default.isNotBlank()) ordered.add(default)
-        ordered.addAll(branches)
-        return ordered.toList()
-    }
-
-    private fun baseModel(branches: List<String>): ComboBoxModel<String> {
-        return DefaultComboBoxModel(branches.toTypedArray())
-    }
-
     private fun variantTitle(value: String): String = value.replaceFirstChar { it.titlecase() }
+
+    private enum class DialogTab { NEW, PR, BRANCH }
 }

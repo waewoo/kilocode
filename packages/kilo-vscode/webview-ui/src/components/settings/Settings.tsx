@@ -1,7 +1,8 @@
-import { Component, createSignal, createEffect, createMemo, on, Show } from "solid-js"
+import { Component, createSignal, createEffect, createMemo, lazy, on, onCleanup, Show } from "solid-js"
 import { Icon } from "@kilocode/kilo-ui/icon"
 import { Tabs } from "@kilocode/kilo-ui/tabs"
 import { Button } from "@kilocode/kilo-ui/button"
+import { useDialog } from "@kilocode/kilo-ui/context/dialog"
 import { Tooltip } from "@kilocode/kilo-ui/tooltip"
 import { showToast } from "@kilocode/kilo-ui/toast"
 import { useVSCode } from "../../context/vscode"
@@ -9,31 +10,258 @@ import { useLanguage } from "../../context/language"
 import { useConfig } from "../../context/config"
 import { useSession } from "../../context/session"
 import ModelsTab from "./ModelsTab"
-import ProvidersTab from "./ProvidersTab"
-import AgentBehaviourTab from "./AgentBehaviourTab"
-import AutoApproveTab from "./AutoApproveTab"
-import BrowserTab from "./BrowserTab"
-import CheckpointsTab from "./CheckpointsTab"
-import DisplayTab from "./DisplayTab"
-import AutocompleteTab from "./AutocompleteTab"
-import NotificationsTab from "./NotificationsTab"
-import ContextTab from "./ContextTab"
-
-import CommitMessageTab from "./CommitMessageTab"
-import ExperimentalTab from "./ExperimentalTab"
-import LanguageTab from "./LanguageTab"
-import AboutKiloCodeTab from "./AboutKiloCodeTab"
-import IndexingTab from "./IndexingTab"
-import SandboxingTab from "./SandboxingTab"
 import * as Sandboxing from "./sandboxing"
 import { useServer } from "../../context/server"
 import type { MigrationSource } from "../../types/messages"
 import { configMessage } from "../../utils/open-config"
+import type {
+  AgentManagerSettingsBranchesLoadedMessage,
+  AgentManagerSettingsLoadedMessage,
+  AgentManagerSettingsProject,
+  ExtensionMessage,
+} from "../../types/messages"
+import { Select } from "@kilocode/kilo-ui/select"
+import { Card } from "@kilocode/kilo-ui/card"
+import { Spinner } from "@kilocode/kilo-ui/spinner"
+import { Switch } from "@kilocode/kilo-ui/switch"
+import { TextField } from "@kilocode/kilo-ui/text-field"
+import SettingsRow from "./SettingsRow"
+import SettingsSearch from "./SettingsSearch"
+import SettingsSearchResults from "./SettingsSearchResults"
+import { SETTINGS_TABS, type SettingsTab } from "./settings-search"
+import { useSettingsSearch } from "./useSettingsSearch"
+import { ProjectBranchDialog } from "../../../agent-manager/ProjectBranchDialog"
+
+const DisplayTab = lazy(() => import("./DisplayTab"))
+const ProvidersTab = lazy(() => import("./ProvidersTab"))
+const AgentBehaviourTab = lazy(() => import("./AgentBehaviourTab"))
+const AutoApproveTab = lazy(() => import("./AutoApproveTab"))
+const BrowserTab = lazy(() => import("./BrowserTab"))
+const CheckpointsTab = lazy(() => import("./CheckpointsTab"))
+const AutocompleteTab = lazy(() => import("./AutocompleteTab"))
+const NotificationsTab = lazy(() => import("./NotificationsTab"))
+const ContextTab = lazy(() => import("./ContextTab"))
+const CommitMessageTab = lazy(() => import("./CommitMessageTab"))
+const ExperimentalTab = lazy(() => import("./ExperimentalTab"))
+const LanguageTab = lazy(() => import("./LanguageTab"))
+const AboutKiloCodeTab = lazy(() => import("./AboutKiloCodeTab"))
+const IndexingTab = lazy(() => import("./IndexingTab"))
+const SandboxingTab = lazy(() => import("./SandboxingTab"))
 
 export interface SettingsProps {
   tab?: string
+  subtab?: string
+  focus?: { token: number; value: string }
+  agentManagerProjectId?: string
+  agentManagerSettings?: boolean
   onTabChange?: (tab: string) => void
-  onMigrationClick?: (source: MigrationSource) => void // legacy-migration
+  onAgentBehaviourNavigationConsumed?: () => void
+  onMigrationClick?: (source: MigrationSource) => void
+  /** Increments when the host asks to open the settings search. */
+  searchRequest?: number
+}
+
+const AgentManagerTab: Component<{ projectId?: string }> = (props) => {
+  const language = useLanguage()
+  const { settings, updateSetting, applySetting } = useConfig()
+  const vscode = useVSCode()
+  const dialog = useDialog()
+  const [projects, setProjects] = createSignal<AgentManagerSettingsProject[]>([])
+  const remembered = vscode.getState<{ agentManagerProjectId?: string }>()?.agentManagerProjectId
+  const [selected, setSelected] = createSignal<string | undefined>(props.projectId ?? remembered)
+  const [branches, setBranches] = createSignal<AgentManagerSettingsBranchesLoadedMessage>()
+  const [branchLoading, setBranchLoading] = createSignal(false)
+  const [loading, setLoading] = createSignal(true)
+  let count = 0
+  let latestSettings = ""
+  let latestBranches = ""
+  const issue = () => {
+    return `${Date.now() * 1000 + ++count}`
+  }
+  const scriptPath = () =>
+    projects().find((item) => item.id === selected())?.setupScriptPath ?? branches()?.setupScriptPath
+  const load = (projectId?: string) => {
+    if (!projectId) return
+    setSelected(projectId)
+    setBranches(undefined)
+    setBranchLoading(false)
+    vscode.setState({ ...vscode.getState<Record<string, unknown>>(), agentManagerProjectId: projectId })
+    latestSettings = issue()
+    latestBranches = latestSettings
+    vscode.postMessage({ type: "requestAgentManagerSettings", projectId, requestId: latestSettings })
+  }
+  const loadBranches = (projectId?: string) => {
+    if (!projectId || (branches()?.projectId === projectId && !branches()?.error) || branchLoading()) return
+    setBranchLoading(true)
+    latestBranches = issue()
+    vscode.postMessage({ type: "requestAgentManagerSettingsBranches", projectId, requestId: latestBranches })
+  }
+  createEffect(() => {
+    if (props.projectId && props.projectId !== selected()) load(props.projectId)
+  })
+  const onMessage = (message: ExtensionMessage) => {
+    if (message.type === "agentManagerSettingsLoaded") {
+      const event = message as AgentManagerSettingsLoadedMessage
+      if (event.requestId !== latestSettings) return
+      setProjects(event.projects)
+      const current = selected()
+      const next = event.projects.some((project) => project.id === current) ? current : event.projectId
+      setSelected(next)
+      setLoading(false)
+      return
+    }
+    if (message.type === "agentManagerSettingsBranchesLoaded") {
+      const event = message as AgentManagerSettingsBranchesLoadedMessage
+      if (event.requestId !== latestBranches) return
+      if (event.projectId === selected()) {
+        setBranches(event.error ? undefined : event)
+        setBranchLoading(false)
+      }
+    }
+  }
+  const initial = props.projectId ?? remembered
+  const timeout = setTimeout(() => setLoading(false), 3000)
+  const unsubscribe = vscode.onMessage(onMessage)
+  onCleanup(() => {
+    unsubscribe()
+    clearTimeout(timeout)
+  })
+  latestSettings = issue()
+  vscode.postMessage({ type: "requestAgentManagerSettings", projectId: initial, requestId: latestSettings })
+  const project = () => projects().find((item) => item.id === selected())
+  const projectText = (item: AgentManagerSettingsProject) => `${item.label} - ${item.root}`
+  const branchLabel = () => {
+    const data = branches()
+    const configured = data ? data.configuredBaseBranch : project()?.defaultBaseBranch
+    if (configured) return configured
+    const detected = data?.defaultBranch ?? project()?.defaultBranch
+    return `${language.t("agentManager.worktree.defaultBaseBranchAuto")}${detected ? ` (${detected})` : ""}`
+  }
+  const setBranch = (branch?: string) => {
+    const id = selected()
+    if (!id) return
+    setBranches((current) => (current ? { ...current, configuredBaseBranch: branch } : current))
+    latestSettings = issue()
+    latestBranches = latestSettings
+    vscode.postMessage({ type: "setAgentManagerDefaultBaseBranch", projectId: id, branch, requestId: latestSettings })
+  }
+  const openBranches = () => {
+    const id = selected()
+    if (!id || project()?.missing) return
+    loadBranches(id)
+    dialog.show(() => (
+      <ProjectBranchDialog
+        selected={branches()?.configuredBaseBranch ?? project()?.defaultBaseBranch}
+        detected={branches()?.defaultBranch ?? project()?.defaultBranch}
+        branches={() => branches()?.branches ?? []}
+        loading={branchLoading}
+        onClose={() => dialog.close()}
+        onSelect={setBranch}
+      />
+    ))
+  }
+  return (
+    <Show when={!loading()} fallback={<Spinner />}>
+      <div class="settings-agent-manager">
+        <Card>
+          <SettingsRow
+            title={language.t("agentManager.settings.autoBranchNaming.title")}
+            description={language.t("agentManager.settings.autoBranchNaming.description")}
+          >
+            <Switch
+              checked={(settings()["agentManager.autoBranchNaming"] as boolean | undefined) ?? true}
+              onChange={(value) => updateSetting("agentManager.autoBranchNaming", value)}
+              hideLabel
+            >
+              {language.t("agentManager.settings.autoBranchNaming.title")}
+            </Switch>
+          </SettingsRow>
+          <SettingsRow
+            title={language.t("agentManager.settings.branchPrefix.title")}
+            description={language.t("agentManager.settings.branchPrefix.description")}
+          >
+            <TextField
+              label={language.t("agentManager.settings.branchPrefix.title")}
+              hideLabel
+              value={(settings()["agentManager.branchPrefix"] as string | undefined) ?? ""}
+              placeholder="feature/"
+              onChange={(value) => updateSetting("agentManager.branchPrefix", value)}
+            />
+          </SettingsRow>
+          <SettingsRow
+            title={language.t("agentManager.settings.worktreePool.title")}
+            description={language.t("agentManager.settings.worktreePool.description")}
+          >
+            <Switch
+              checked={(settings()["agentManager.worktreePool"] as boolean | undefined) ?? true}
+              onChange={(value) => applySetting("agentManager.worktreePool", value)}
+              hideLabel
+            >
+              {language.t("agentManager.settings.worktreePool.title")}
+            </Switch>
+          </SettingsRow>
+          <SettingsRow
+            title={language.t("agentManager.settings.project.title")}
+            description={language.t("agentManager.settings.project.description")}
+          >
+            <Select
+              options={projects()}
+              current={project()}
+              value={(item) => item.id}
+              label={projectText}
+              onSelect={(item) => load(item?.id)}
+              variant="secondary"
+              size="small"
+              triggerVariant="settings"
+              triggerProps={{ title: project()?.root }}
+              children={(item) => (item ? <span title={projectText(item)}>{projectText(item)}</span> : "")}
+            />
+          </SettingsRow>
+          <Show when={project()} fallback={<p>{language.t("agentManager.settings.project.empty")}</p>}>
+            <SettingsRow
+              title={language.t("agentManager.worktree.defaultBaseBranch")}
+              description={language.t("agentManager.settings.defaultBaseBranch.description")}
+            >
+              <Button
+                variant="secondary"
+                size="small"
+                class="settings-branch-trigger"
+                title={branchLabel()}
+                disabled={project()?.missing || branchLoading()}
+                onClick={openBranches}
+              >
+                <span class="settings-branch-trigger-label">{branchLabel()}</span>
+                <Icon name="selector" size="small" />
+              </Button>
+            </SettingsRow>
+            <SettingsRow
+              title={language.t("agentManager.worktree.setupScript")}
+              description={language.t("agentManager.settings.setupScript.description")}
+              last
+            >
+              <Button
+                variant="secondary"
+                size="small"
+                icon="edit"
+                disabled={project()?.missing}
+                onClick={() =>
+                  vscode.postMessage({
+                    type: "configureAgentManagerSetupScript",
+                    projectId: selected()!,
+                    requestId: (latestSettings = issue()),
+                  })
+                }
+              >
+                {scriptPath()
+                  ? language.t("agentManager.settings.setupScript.edit")
+                  : language.t("agentManager.settings.setupScript.create")}
+              </Button>
+            </SettingsRow>
+          </Show>
+        </Card>
+      </div>
+    </Show>
+  )
 }
 
 const Settings: Component<SettingsProps> = (props) => {
@@ -44,7 +272,13 @@ const Settings: Component<SettingsProps> = (props) => {
   const session = useSession()
   const [active, setActive] = createSignal(props.tab ?? "models")
   const [errorExpanded, setErrorExpanded] = createSignal(false)
-  const sandboxing = createMemo(() => Sandboxing.visible(features()))
+  // Keep requested tabs registered while config loads so Tabs does not reset them to Models.
+  const indexing = createMemo(
+    () => features().indexing || (loading() && (active() === "indexing" || props.tab === "indexing")),
+  )
+  const sandboxing = createMemo(
+    () => Sandboxing.visible(features()) || (loading() && (active() === "sandboxing" || props.tab === "sandboxing")),
+  )
 
   const busyCount = () => Object.values(session.allStatusMap()).filter((s) => s.type === "busy").length
 
@@ -81,7 +315,7 @@ const Settings: Component<SettingsProps> = (props) => {
   )
 
   createEffect(() => {
-    if (features().indexing || active() !== "indexing") return
+    if (loading() || features().indexing || active() !== "indexing") return
     onTabChange("providers")
   })
 
@@ -96,8 +330,27 @@ const Settings: Component<SettingsProps> = (props) => {
     vscode.postMessage({ type: "settingsTabChanged", tab })
   }
 
+  const searchTabs = createMemo<SettingsTab[]>(() =>
+    SETTINGS_TABS.filter((tab) => {
+      if (tab.id === "indexing") return features().indexing
+      if (tab.id === "sandboxing") return sandboxing()
+      if (tab.id === "agentManager") return props.agentManagerSettings === true
+      return true
+    }),
+  )
+
+  const search = useSettingsSearch({
+    tabs: searchTabs,
+    translate: (key) => language.t(key),
+    onSelectTab: onTabChange,
+    searchRequest: () => props.searchRequest,
+  })
+
   return (
-    <div style={{ display: "flex", "flex-direction": "column", height: "100%", "min-height": 0 }}>
+    <div
+      data-searching={search.searching() ? "true" : undefined}
+      style={{ display: "flex", "flex-direction": "column", height: "100%", "min-height": 0 }}
+    >
       {/* Header */}
       <div
         style={{
@@ -131,10 +384,26 @@ const Settings: Component<SettingsProps> = (props) => {
         orientation="vertical"
         variant="settings"
         value={active()}
-        onChange={onTabChange}
+        onChange={(tab) => {
+          if (search.searching()) search.clear()
+          onTabChange(tab)
+        }}
         style={{ flex: 1, overflow: "hidden" }}
       >
         <Tabs.List>
+          <div data-slot="settings-search-slot">
+            <SettingsSearch
+              query={search.query()}
+              focusRequest={search.focusTick()}
+              listId={search.listId}
+              activeId={search.activeId()}
+              onInput={search.input}
+              onClear={search.clear}
+              onMove={search.move}
+              onChoose={search.choose}
+              onDismiss={search.clear}
+            />
+          </div>
           <Tabs.Trigger value="models" aria-label={language.t("settings.models.title")}>
             <Icon name="models" />
             <span class="label">{language.t("settings.models.title")}</span>
@@ -151,6 +420,12 @@ const Settings: Component<SettingsProps> = (props) => {
             <Icon name="checklist" />
             <span class="label">{language.t("settings.autoApprove.title")}</span>
           </Tabs.Trigger>
+          <Show when={props.agentManagerSettings}>
+            <Tabs.Trigger value="agentManager" aria-label={language.t("agentManager.settings.title")}>
+              <Icon name="settings-gear" />
+              <span class="label">{language.t("agentManager.settings.title")}</span>
+            </Tabs.Trigger>
+          </Show>
           <Tabs.Trigger value="browser" aria-label={language.t("settings.webTools.title")}>
             <Icon name="window-cursor" />
             <span class="label">{language.t("settings.webTools.title")}</span>
@@ -180,7 +455,7 @@ const Settings: Component<SettingsProps> = (props) => {
             <Icon name="edit" />
             <span class="label">{language.t("settings.commitMessage.title")}</span>
           </Tabs.Trigger>
-          <Show when={features().indexing}>
+          <Show when={indexing()}>
             <Tabs.Trigger value="indexing" aria-label={language.t("settings.indexing.title")}>
               <Icon name="database" />
               <span class="label">{language.t("settings.indexing.title")}</span>
@@ -216,12 +491,22 @@ const Settings: Component<SettingsProps> = (props) => {
         </Tabs.Content>
         <Tabs.Content value="agentBehaviour">
           <h3>{language.t("settings.agentBehaviour.title")}</h3>
-          <AgentBehaviourTab />
+          <AgentBehaviourTab
+            subtab={props.subtab}
+            focus={props.focus}
+            onNavigationConsumed={props.onAgentBehaviourNavigationConsumed}
+          />
         </Tabs.Content>
         <Tabs.Content value="autoApprove">
           <h3>{language.t("settings.autoApprove.title")}</h3>
           <AutoApproveTab />
         </Tabs.Content>
+        <Show when={props.agentManagerSettings}>
+          <Tabs.Content value="agentManager">
+            <h3>{language.t("agentManager.settings.title")}</h3>
+            <AgentManagerTab projectId={props.agentManagerProjectId} />
+          </Tabs.Content>
+        </Show>
         <Tabs.Content value="browser">
           <h3>{language.t("settings.webTools.title")}</h3>
           <BrowserTab />
@@ -244,14 +529,14 @@ const Settings: Component<SettingsProps> = (props) => {
         </Tabs.Content>
         <Tabs.Content value="context">
           <h3>{language.t("settings.context.title")}</h3>
-          <ContextTab />
+          <ContextTab onNavigateToModels={() => onTabChange("models")} />
         </Tabs.Content>
 
         <Tabs.Content value="commitMessage">
           <h3>{language.t("settings.commitMessage.title")}</h3>
           <CommitMessageTab />
         </Tabs.Content>
-        <Show when={features().indexing}>
+        <Show when={indexing()}>
           <Tabs.Content value="indexing">
             <h3>{language.t("settings.indexing.title")}</h3>
             <IndexingTab />
@@ -280,6 +565,18 @@ const Settings: Component<SettingsProps> = (props) => {
             onMigrationClick={props.onMigrationClick}
           />
         </Tabs.Content>
+
+        <Show when={search.searching()}>
+          <SettingsSearchResults
+            query={search.query()}
+            results={search.results()}
+            active={search.active()}
+            listId={search.listId}
+            tabs={searchTabs()}
+            onHover={search.setActive}
+            onSelect={search.select}
+          />
+        </Show>
       </Tabs>
 
       {/* Save bar — slides in when there are unsaved config changes */}

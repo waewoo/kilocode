@@ -91,6 +91,7 @@ describe("ensureSandbox", () => {
 
 describe("Agent Manager sandbox startup", () => {
   const provider = readFileSync(join(__dirname, "..", "..", "src", "agent-manager", "AgentManagerProvider.ts"), "utf8")
+  const discard = readFileSync(join(__dirname, "..", "..", "src", "agent-manager", "discard-worktree.ts"), "utf8")
   const flow = readFileSync(join(__dirname, "..", "..", "src", "agent-manager", "provider-multi-version.ts"), "utf8")
   const dialog = readFileSync(
     join(__dirname, "..", "..", "webview-ui", "agent-manager", "NewWorktreeDialog.tsx"),
@@ -104,7 +105,7 @@ describe("Agent Manager sandbox startup", () => {
     const gate = version.indexOf("await reconcileSandbox")
     const register = version.indexOf("host.register", gate)
     const ready = version.indexOf("host.notifyReady", register)
-    const created = version.indexOf("return {", ready)
+    const created = version.indexOf("const result: CreatedVersion = {", ready)
     expect(gate).toBeGreaterThan(-1)
     expect(register).toBeGreaterThan(gate)
     expect(ready).toBeGreaterThan(register)
@@ -123,13 +124,13 @@ describe("Agent Manager sandbox startup", () => {
 
     // The created sessions feed the initial prompt phase.
     const prompts = flow.slice(flow.indexOf("function sendInitialPrompt"))
-    expect(prompts).toContain("buildInitialMessages([created]")
+    expect(prompts).toMatch(/buildInitialMessages\(\s*\[created\]/)
     expect(prompts).toContain('type: "agentManager.sendInitialMessage"')
   })
 
   test("deletes the fresh branch when sandbox setup rolls back", () => {
     expect(provider).toContain("private async discardWorktree(id: string, dir: string, branch: string")
-    expect(provider).toContain("removeWorktree(dir, branch)")
+    expect(discard).toContain("removeWorktree(dir, branch)")
     expect(flow).toContain("wt.result.path, wt.result.branch, sessionId")
   })
 
@@ -147,7 +148,7 @@ describe("Agent Manager sandbox startup", () => {
   })
 
   test("places the sandbox toggle with prompt actions instead of model selectors", () => {
-    const selectors = dialog.indexOf('<div class="prompt-input-hint-selectors">')
+    const selectors = dialog.indexOf("<PromptSelectors")
     const actions = dialog.indexOf('<div class="prompt-input-hint-actions">', selectors)
     const sandbox = dialog.indexOf("<SandboxButtonBase", actions)
     const speech = dialog.indexOf("<SpeechToTextButton", actions)

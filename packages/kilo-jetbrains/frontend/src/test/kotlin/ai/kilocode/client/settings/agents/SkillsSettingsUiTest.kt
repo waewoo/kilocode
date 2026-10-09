@@ -3,17 +3,23 @@ package ai.kilocode.client.settings.agents
 import ai.kilocode.client.util.edtWait
 import ai.kilocode.client.app.KiloAgentBehaviorService
 import ai.kilocode.client.app.KiloAppService
+import ai.kilocode.client.app.KiloMarketplaceService
 import ai.kilocode.client.app.KiloWorkspaceService
+import ai.kilocode.client.plugin.KiloBundle
+import ai.kilocode.client.settings.base.SettingsInfo
 import ai.kilocode.client.settings.base.SettingsPathDialogHandle
 import ai.kilocode.client.testing.FakeAgentBehaviorRpcApi
 import ai.kilocode.client.testing.FakeAppRpcApi
+import ai.kilocode.client.testing.FakeMarketplaceRpcApi
 import ai.kilocode.client.testing.FakeWorkspaceRpcApi
 import ai.kilocode.client.testing.fire
+import ai.kilocode.client.testing.rowLines
 import ai.kilocode.client.ui.list.ActiveListItem
 import ai.kilocode.client.ui.list.activeListCellBounds
 import ai.kilocode.rpc.dto.ConfigDto
 import ai.kilocode.rpc.dto.KiloAppStateDto
 import ai.kilocode.rpc.dto.KiloAppStatusDto
+import ai.kilocode.rpc.dto.MarketplaceBundleDto
 import ai.kilocode.rpc.dto.SkillDto
 import ai.kilocode.rpc.dto.SkillsConfigDto
 import com.intellij.openapi.application.ApplicationManager
@@ -26,7 +32,7 @@ import com.intellij.openapi.ui.TestDialog
 import com.intellij.openapi.ui.TestDialogManager
 import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import com.intellij.testFramework.replaceService
-import com.intellij.ui.SimpleColoredComponent
+import com.intellij.ui.SearchTextField
 import com.intellij.ui.TitledSeparator
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBList
@@ -55,6 +61,7 @@ class SkillsSettingsUiTest : BasePlatformTestCase() {
     private lateinit var appRpc: FakeAppRpcApi
     private lateinit var agentRpc: FakeAgentBehaviorRpcApi
     private lateinit var workspaceRpc: FakeWorkspaceRpcApi
+    private lateinit var marketRpc: FakeMarketplaceRpcApi
     private var shown = 0
 
     override fun tearDown() {
@@ -66,6 +73,17 @@ class SkillsSettingsUiTest : BasePlatformTestCase() {
             scope = null
         } finally {
             super.tearDown()
+        }
+    }
+
+    fun `test page shows exactly one info banner explaining skills`() {
+        val panel = panel()
+        flushUntil { rows(panel).size == 3 }
+
+        edt {
+            val info = components(panel).filterIsInstance<SettingsInfo>().single()
+            assertEquals(KiloBundle.message("settings.agentBehavior.skills.info"), bannerIntro(info))
+            true
         }
     }
 
@@ -119,6 +137,16 @@ class SkillsSettingsUiTest : BasePlatformTestCase() {
         }
     }
 
+    fun `test toolbar offers marketplace as final button after separator`() {
+        val panel = panel()
+        flushUntil { rows(panel).size == 3 }
+
+        edt {
+            assertMarketplaceToolbarButton(panel)
+            true
+        }
+    }
+
     fun `test sources section has additional sources title`() {
         val panel = panel()
         flushUntil { sourceRows(panel).size == 2 }
@@ -154,11 +182,10 @@ class SkillsSettingsUiTest : BasePlatformTestCase() {
             val comp = list.cellRenderer.getListCellRendererComponent(list, row, idx, true, true)
             comp.setSize(520, list.fixedCellHeight)
             layout(comp)
-            val title = components(comp).filterIsInstance<SimpleColoredComponent>().single()
-            val labels = components(comp).filterIsInstance<JBLabel>().filter { it.isVisible }.map { it.text }
+            val (title, desc) = rowLines(comp)
 
             assertEquals("plan  $CUSTOM", title.toString())
-            assertTrue(labels.contains("Plan work"))
+            assertEquals("Plan work", desc.toString())
             true
         }
     }
@@ -274,6 +301,17 @@ class SkillsSettingsUiTest : BasePlatformTestCase() {
         assertEquals(listOf(DIR to CUSTOM), agentRpc.skillRemovals)
     }
 
+    fun `test delete selects the skill that took the deleted slot`() {
+        val panel = panel()
+        flushUntil { rows(panel).size == 3 }
+        val next = edt { rows(panel)[1].key }
+        TestDialogManager.setTestDialog(TestDialog.YES)
+
+        click(skillsList(panel), panel, CUSTOM, "delete")
+
+        assertEquals(next, edt { skillsList(panel).selectedValue?.key })
+    }
+
     fun `test delete action requires confirmation`() {
         val panel = panel()
         flushUntil { rows(panel).size == 3 }
@@ -284,6 +322,64 @@ class SkillsSettingsUiTest : BasePlatformTestCase() {
         edt { UIUtil.dispatchAllInvocationEvents(); true }
         assertTrue(agentRpc.skillRemovals.isEmpty())
         assertTrue(edt { rows(panel).any { it.key == CUSTOM } })
+    }
+
+    /**
+     * Bundle ownership only decides whether a delete offers to remove a whole Marketplace install.
+     * A Marketplace outage must not stop the page from listing and managing skills.
+     */
+    fun `test marketplace bundle failure still lists skills`() {
+        val panel = panel()
+        flushUntil { rows(panel).size == 3 }
+        val calls = marketRpc.bundleCalls.size
+
+        marketRpc.bundlesError = RuntimeException("marketplace offline")
+        edt { panel.reload(); true }
+        flushUntil { marketRpc.bundleCalls.size > calls && searchField(panel).isEnabled }
+
+        edt {
+            assertEquals(3, rows(panel).size)
+            assertTrue(rows(panel).any { it.key == CUSTOM })
+            true
+        }
+    }
+
+    fun `test deleting a companion skill stages its whole marketplace bundle`() {
+        val panel = panel()
+        flushUntil { rows(panel).size == 3 }
+        marketRpc.bundles = listOf(MarketplaceBundleDto("anaconda", "global", listOf(CUSTOM)))
+        edt { panel.reload(); true }
+        flushUntil { marketRpc.bundleCalls.size >= 2 && searchField(panel).isEnabled }
+        var message = ""
+        TestDialogManager.setTestDialog {
+            message = it
+            Messages.YES
+        }
+
+        click(skillsList(panel), panel, CUSTOM, "delete")
+
+        assertTrue(message.contains("anaconda"))
+        assertTrue(edt { rows(panel).none { it.key == CUSTOM } })
+        assertTrue(marketRpc.removeCalls.isEmpty())
+        edt { panel.applyDraft(); true }
+        flushUntil { marketRpc.removeCalls.isNotEmpty() }
+        assertEquals(FakeMarketplaceRpcApi.RemoveCall(DIR, "anaconda", "mcp", "global"), marketRpc.removeCalls.single())
+        assertTrue(agentRpc.skillRemovals.isEmpty())
+    }
+
+    fun `test declining companion skill removal keeps the whole bundle`() {
+        val panel = panel()
+        flushUntil { rows(panel).size == 3 }
+        marketRpc.bundles = listOf(MarketplaceBundleDto("anaconda", "global", listOf(CUSTOM)))
+        edt { panel.reload(); true }
+        flushUntil { marketRpc.bundleCalls.size >= 2 && searchField(panel).isEnabled }
+        TestDialogManager.setTestDialog { Messages.NO }
+
+        click(skillsList(panel), panel, CUSTOM, "delete")
+
+        assertTrue(edt { rows(panel).any { it.key == CUSTOM } })
+        assertFalse(edt { panel.modified() })
+        assertTrue(marketRpc.removeCalls.isEmpty())
     }
 
     fun `test add path and url write skills config patch on apply`() {
@@ -477,6 +573,7 @@ class SkillsSettingsUiTest : BasePlatformTestCase() {
         scope = cs
         appRpc = FakeAppRpcApi()
         workspaceRpc = FakeWorkspaceRpcApi()
+        marketRpc = FakeMarketplaceRpcApi()
         agentRpc = FakeAgentBehaviorRpcApi().apply {
             skills = listOf(
                 SkillDto("plan", "Plan work", CUSTOM, "# Plan\nUse steps", editable = true),
@@ -497,6 +594,11 @@ class SkillsSettingsUiTest : BasePlatformTestCase() {
         ApplicationManager.getApplication().replaceService(KiloAppService::class.java, app, testRootDisposable)
         ApplicationManager.getApplication().replaceService(KiloAgentBehaviorService::class.java, KiloAgentBehaviorService(cs, agentRpc), testRootDisposable)
         ApplicationManager.getApplication().replaceService(KiloWorkspaceService::class.java, KiloWorkspaceService(cs, workspaceRpc), testRootDisposable)
+        ApplicationManager.getApplication().replaceService(
+            KiloMarketplaceService::class.java,
+            KiloMarketplaceService(cs, marketRpc),
+            testRootDisposable,
+        )
     }
 
     private fun click(list: JBList<ActiveListItem>, panel: SkillsSettingsUi, key: String, id: String) {
@@ -534,6 +636,13 @@ class SkillsSettingsUiTest : BasePlatformTestCase() {
     }
 
     private fun skillsList(panel: SkillsSettingsUi) = components(panel).filterIsInstance<JBList<ActiveListItem>>().first()
+
+    private fun searchField(panel: SkillsSettingsUi) = components(panel).filterIsInstance<SearchTextField>().single()
+
+    private fun bannerIntro(info: SettingsInfo): String {
+        val pane = UIUtil.findComponentOfType(info, javax.swing.JEditorPane::class.java) ?: error("no banner text")
+        return pane.text.replace(Regex("<[^>]+>"), "").replace(Regex("\\s+"), " ").trim()
+    }
 
     private fun sourceList(panel: SkillsSettingsUi) = components(panel).filterIsInstance<JBList<ActiveListItem>>().last()
 

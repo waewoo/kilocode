@@ -11,6 +11,7 @@ import {
   sessionThroughput,
   formatTG,
   buildFamilyCosts,
+  sessionCost,
   buildFamilyParents,
   buildFamilyParentsFromTools,
   buildFamilyLabels,
@@ -23,8 +24,11 @@ import {
   removeSessionToolPartsForMessage,
   upsertSessionToolPart,
   recentSessions,
+  optimistic,
+  revertPromptState,
 } from "../../webview-ui/src/context/session-utils"
 import type { Message, Part, ToolPart } from "../../webview-ui/src/types/messages"
+import { formatBrowserFeedback } from "../../src/shared/browser-feedback"
 
 const t = (key: string) => key
 
@@ -429,6 +433,52 @@ describe("buildFamilyCosts", () => {
     expect(costs.get("b")).toBe(3)
     expect(costs.get("c")).toBe(4)
     expect(sum).toBe(10)
+  })
+})
+
+describe("sessionCost", () => {
+  const tokens = { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
+  const usage = {
+    sessionIDs: ["root", "child", "grand", "sibling"],
+    sessionCost: 15,
+    totals: { cost: 15, steps: 4, tokens },
+  }
+
+  it("restores the total when older subagent costs fall outside the loaded page", () => {
+    const messages = Array.from({ length: 100 }, (_, i) => msg(`m${i}`, "assistant", i === 0 ? 15 : 0))
+    const costs = buildFamilyCosts(new Set(["root"]), { root: messages.slice(-80) }, { root: {} })
+    const items = [...costs.values()].map((cost) => ({ cost }))
+    expect(sessionCost(items, { id: "root" }, undefined)).toEqual({ total: 0, partial: false })
+    expect(sessionCost(items, { id: "root" }, usage)).toEqual({ total: 15, partial: true })
+    expect(sessionCost([{ cost: 15 }], { id: "root" }, usage)).toEqual({ total: 15, partial: false })
+  })
+
+  it("uses the child subtree cost, not the parent and siblings", () => {
+    expect(sessionCost([{ cost: 2 }], { id: "child", parentID: "root" }, { ...usage, sessionCost: 10 })).toEqual({
+      total: 10,
+      partial: true,
+    })
+  })
+
+  it("keeps newer live cost above a stale aggregate", () => {
+    expect(sessionCost([{ cost: 16 }], { id: "root" }, usage)).toEqual({ total: 16, partial: true })
+  })
+
+  it("ignores an unrelated usage response after switching sessions", () => {
+    expect(sessionCost([{ cost: 1 }], { id: "other" }, usage)).toEqual({ total: 1, partial: false })
+    expect(sessionCost([], undefined, usage)).toEqual({ total: 0, partial: false })
+  })
+
+  it("uses legacy tree totals only for root sessions", () => {
+    const legacy = { ...usage, sessionCost: undefined }
+    expect(sessionCost([{ cost: 1 }], { id: "root" }, legacy)).toEqual({ total: 15, partial: true })
+    expect(sessionCost([{ cost: 2 }], { id: "child", parentID: "root" }, legacy)).toEqual({ total: 2, partial: false })
+  })
+
+  it("treats rounding differences as a complete breakdown", () => {
+    expect(sessionCost([{ cost: 0.1 }, { cost: 0.2 }], { id: "root" }, { ...usage, sessionCost: 0.3 }).partial).toBe(
+      false,
+    )
   })
 })
 
@@ -981,5 +1031,85 @@ describe("sessionThroughput", () => {
 
   it("returns undefined for empty input", () => {
     expect(sessionThroughput([])).toBeUndefined()
+  })
+})
+
+describe("optimistic parts", () => {
+  it("preserves attachments and message ownership with unique part IDs", () => {
+    const file = {
+      mime: "image/png",
+      url: "data:image/png;base64,abc",
+      filename: "shot.png",
+      source: { type: "file" as const, path: "shot.png", text: { value: "@shot.png", start: 0, end: 9 } },
+    }
+    const parts = optimistic("message", "Hello", [file])
+    expect(parts).toMatchObject([
+      { type: "text", id: expect.any(String), messageID: "message", text: "Hello" },
+      { type: "file", id: expect.any(String), messageID: "message", ...file },
+    ])
+    expect(parts.at(0)?.id).not.toBe(parts.at(1)?.id)
+    expect(optimistic("empty", "")).toEqual([])
+  })
+})
+
+describe("revertPromptState", () => {
+  const text = (value: string, synthetic = false) =>
+    ({ type: "text", id: `t-${value}`, text: value, synthetic }) as Part
+  const file = (overrides: Partial<Extract<Part, { type: "file" }>>) =>
+    ({ type: "file", id: "f", mime: "text/plain", url: "", ...overrides }) as Extract<Part, { type: "file" }>
+
+  it("joins non-synthetic text parts and drops synthetic ones", () => {
+    const state = revertPromptState([text("Hello "), { ...text("hidden", true) } as Part, text("world")])
+    expect(state.text).toBe("Hello world")
+  })
+
+  it("restores inline image attachments from data URLs only", () => {
+    const state = revertPromptState([
+      file({ mime: "image/png", url: "data:image/png;base64,abc", filename: "shot.png" }),
+      file({ mime: "image/jpeg", url: "https://example.com/x.jpg" }),
+      file({ mime: "application/pdf", url: "data:application/pdf;base64,def" }),
+    ])
+    expect(state.images).toEqual([{ dataUrl: "data:image/png;base64,abc", mime: "image/png", filename: "shot.png" }])
+  })
+
+  it("collects mention paths but excludes session references from paths", () => {
+    const state = revertPromptState([
+      file({ source: { type: "file", path: "a b.txt", text: { value: "@a b.txt", start: 0, end: 8 } } }),
+      file({ url: "session:ses_1", filename: "Old chat" }),
+    ])
+    expect(state.paths).toEqual(["a b.txt"])
+  })
+
+  it("maps past-chat references to session items with title fallbacks", () => {
+    const state = revertPromptState([
+      file({
+        url: "session:ses_1",
+        source: { type: "file", path: "", text: { value: "@Renamed chat", start: 0, end: 13 } },
+      }),
+      file({ url: "session:ses_2", filename: "Fallback title" }),
+    ])
+    expect(state.sessions).toEqual([
+      { id: "ses_1", title: "Renamed chat", updated: 0 },
+      { id: "ses_2", title: "Fallback title", updated: 0 },
+    ])
+  })
+
+  it("returns empty collections for tool-only messages", () => {
+    const part: Part = { type: "tool", id: "p1", tool: "bash", state: { status: "running", input: {} } }
+    const state = revertPromptState([part])
+    expect(state).toEqual({ text: "", paths: [], sessions: [], images: [], review: [], browser: [] })
+  })
+
+  it("restores browser and review metadata without their formatted prefixes", () => {
+    const browser = {
+      version: 1 as const,
+      references: [{ id: "b", sessionId: "s1", selector: "#save", text: "Save" }],
+    }
+    const content = `${formatBrowserFeedback(browser.references)}\n\nPlease update it`
+    const parts = optimistic("message", content, undefined, undefined, browser)
+    expect(revertPromptState(parts)).toMatchObject({
+      text: "Please update it",
+      browser: browser.references,
+    })
   })
 })

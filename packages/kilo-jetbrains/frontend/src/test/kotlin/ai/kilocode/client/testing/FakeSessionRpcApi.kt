@@ -1,10 +1,10 @@
 package ai.kilocode.client.testing
 
 import ai.kilocode.rpc.KiloSessionRpcApi
+import ai.kilocode.rpc.dto.BackgroundJobDto
 import ai.kilocode.rpc.dto.ChatEventDto
 import ai.kilocode.rpc.dto.CloudSessionDto
 import ai.kilocode.rpc.dto.CloudSessionListDto
-import ai.kilocode.rpc.dto.ConfigUpdateDto
 import ai.kilocode.rpc.dto.DiffFileDto
 import ai.kilocode.rpc.dto.MessageWithPartsDto
 import ai.kilocode.rpc.dto.ModelSelectionDto
@@ -17,7 +17,10 @@ import ai.kilocode.rpc.dto.QuestionReplyDto
 import ai.kilocode.rpc.dto.QuestionRequestDto
 import ai.kilocode.rpc.dto.SessionDto
 import ai.kilocode.rpc.dto.SessionActivityDto
+import ai.kilocode.rpc.dto.SessionBoardDto
+import ai.kilocode.rpc.dto.SessionChangeDto
 import ai.kilocode.rpc.dto.SessionListDto
+import ai.kilocode.rpc.dto.SessionShareDto
 import ai.kilocode.rpc.dto.SessionStatusDto
 import ai.kilocode.rpc.dto.SessionTimeDto
 import kotlinx.coroutines.CompletableDeferred
@@ -68,6 +71,11 @@ class FakeSessionRpcApi : KiloSessionRpcApi {
     var cloudCursor: String? = null
     var importedCloudSession = session
 
+    /** Share/unshare call tracking and behaviour. */
+    val shares = mutableListOf<Triple<String, String, Boolean>>()
+    var shareUrl = "https://app.kilo.ai/s/token"
+    var shareThrows: Exception? = null
+
     /** Push chat events here; tests collect from [events]. */
     val events = MutableSharedFlow<ChatEventDto>(extraBufferCapacity = 64, replay = 64)
 
@@ -77,11 +85,25 @@ class FakeSessionRpcApi : KiloSessionRpcApi {
     /** Push activity updates here. */
     val activity = MutableStateFlow<Map<String, SessionActivityDto>>(emptyMap())
 
+    /** Push session lifecycle changes here. */
+    val changes = MutableSharedFlow<SessionChangeDto>(extraBufferCapacity = 64)
+
     /** Pending permissions returned by [pendingPermissions]. */
     val pendingPermissionList = mutableListOf<PermissionRequestDto>()
 
     /** Pending questions returned by [pendingQuestions]. */
     val pendingQuestionList = mutableListOf<QuestionRequestDto>()
+
+    /**
+     * Held before [pendingPermissions]/[pendingQuestions] return, so a test can deliver a live
+     * event (e.g. `QuestionAsked`, `QuestionReplied`) into the gap between a recovery snapshot's
+     * fetch and its EDT commit, then release the gate to observe whether the stale snapshot won.
+     */
+    var pendingGate: CompletableDeferred<Unit>? = null
+    var pendingPermissionCalls = 0
+        private set
+    var pendingQuestionCalls = 0
+        private set
 
     /** Optional custom event stream factory for routing tests. */
     var eventFlow: ((String, String) -> Flow<ChatEventDto>)? = null
@@ -97,6 +119,7 @@ class FakeSessionRpcApi : KiloSessionRpcApi {
     var revertThrows: Exception? = null
     var unrevertThrows: Exception? = null
     var commandThrows: Exception? = null
+    var promptThrows: Exception? = null
     val prompts = mutableListOf<Triple<String, String, PromptDto>>()
     val commands = mutableListOf<CommandCall>()
     val attachmentParts = mutableListOf<AttachmentCall>()
@@ -106,7 +129,6 @@ class FakeSessionRpcApi : KiloSessionRpcApi {
     val messageDeletes = mutableListOf<MessageDeleteCall>()
     var messageDeleteResult = true
     val unreverts = mutableListOf<Pair<String, String>>()
-    val configs = mutableListOf<Pair<String, ConfigUpdateDto>>()
     val permissionReplies = mutableListOf<Triple<String, String, PermissionReplyDto>>()
     val permissionRulesSaved = mutableListOf<Triple<String, String, PermissionAlwaysRulesDto>>()
     val questionReplies = mutableListOf<Triple<String, String, QuestionReplyDto>>()
@@ -126,6 +148,15 @@ class FakeSessionRpcApi : KiloSessionRpcApi {
     /** When set, [create] throws it after incrementing [creates] — simulates a paused backend. */
     var createThrows: Exception? = null
 
+    /** Fork call tracking. [forked] is what [fork] returns; when null it derives one from the source. */
+    val forks = java.util.concurrent.CopyOnWriteArrayList<ForkCall>()
+    var forked: SessionDto? = null
+    var forkThrows: Exception? = null
+
+    /** Holds [fork] open so a test can observe the window a second request would land in. */
+    var forkGate: CompletableDeferred<Unit>? = null
+
+    data class ForkCall(val id: String, val directory: String, val messageId: String?)
     data class CloudCall(val directory: String, val cursor: String?, val limit: Int, val gitUrl: String?)
     data class AttachmentCall(val id: String, val directory: String, val messageId: String, val partId: String, val attachmentKey: String?)
     data class CommandCall(val id: String, val directory: String, val command: String, val arguments: String, val prompt: PromptDto)
@@ -139,6 +170,15 @@ class FakeSessionRpcApi : KiloSessionRpcApi {
         creates++
         createThrows?.let { throw it }
         return session
+    }
+
+    override suspend fun fork(id: String, directory: String, messageId: String?): SessionDto {
+        assertNotEdt("fork")
+        forks.add(ForkCall(id, directory, messageId))
+        forkGate?.await()
+        forkThrows?.let { throw it }
+        val source = listed.firstOrNull { it.id == id } ?: session
+        return forked ?: source.copy(id = "${id}_fork", directory = directory, title = "${source.title} (fork #1)")
     }
 
     override suspend fun list(directory: String): SessionListDto {
@@ -183,6 +223,23 @@ class FakeSessionRpcApi : KiloSessionRpcApi {
         return session.copy(id = id, title = title)
     }
 
+    override suspend fun share(id: String, directory: String): SessionDto {
+        assertNotEdt("share")
+        shares.add(Triple(id, directory, true))
+        shareThrows?.let { throw it }
+        return current(id).copy(share = SessionShareDto(shareUrl))
+    }
+
+    override suspend fun unshare(id: String, directory: String): SessionDto {
+        assertNotEdt("unshare")
+        shares.add(Triple(id, directory, false))
+        shareThrows?.let { throw it }
+        return current(id).copy(share = null)
+    }
+
+    private fun current(id: String): SessionDto =
+        listed.firstOrNull { it.id == id } ?: session.copy(id = id)
+
     override suspend fun cloudSessions(directory: String, cursor: String?, limit: Int, gitUrl: String?): CloudSessionListDto {
         assertNotEdt("cloudSessions")
         cloudCalls.add(CloudCall(directory, cursor, limit, gitUrl))
@@ -205,6 +262,11 @@ class FakeSessionRpcApi : KiloSessionRpcApi {
         return activity
     }
 
+    override suspend fun changes(): Flow<SessionChangeDto> {
+        assertNotEdt("changes")
+        return changes
+    }
+
     override suspend fun setDirectory(id: String, directory: String) {
         assertNotEdt("setDirectory")
     }
@@ -224,6 +286,7 @@ class FakeSessionRpcApi : KiloSessionRpcApi {
 
     override suspend fun prompt(id: String, directory: String, prompt: PromptDto) {
         assertNotEdt("prompt")
+        promptThrows?.let { throw it }
         prompts.add(Triple(id, directory, prompt))
     }
 
@@ -299,11 +362,6 @@ class FakeSessionRpcApi : KiloSessionRpcApi {
         return eventFlow?.invoke(id, directory) ?: events
     }
 
-    override suspend fun updateConfig(directory: String, config: ConfigUpdateDto) {
-        assertNotEdt("updateConfig")
-        configs.add(directory to config)
-    }
-
     var replyPermissionThrows: Exception? = null
 
     override suspend fun replyPermission(requestId: String, directory: String, reply: PermissionReplyDto) {
@@ -329,12 +387,78 @@ class FakeSessionRpcApi : KiloSessionRpcApi {
 
     override suspend fun pendingPermissions(directory: String): List<PermissionRequestDto> {
         assertNotEdt("pendingPermissions")
+        pendingPermissionCalls++
+        pendingGate?.await()
         return pendingPermissionList.toList()
     }
 
     override suspend fun pendingQuestions(directory: String): List<QuestionRequestDto> {
         assertNotEdt("pendingQuestions")
+        pendingQuestionCalls++
+        pendingGate?.await()
         return pendingQuestionList.toList()
+    }
+
+    // ------ background subagents ------
+
+    /** Push background-job list updates here, one flow per root session id. */
+    val backgroundJobsFlow = mutableMapOf<String, MutableSharedFlow<List<BackgroundJobDto>>>()
+    val backgroundJobsCalls = mutableListOf<Pair<String, String>>()
+    val cancelledBackgroundJobs = mutableListOf<Pair<String, String>>()
+    val promotedBackgroundJobs = mutableListOf<Pair<String, String>>()
+    var cancelBackgroundJobResult = true
+    var promoteBackgroundJobResult = true
+
+    override suspend fun backgroundJobs(id: String, directory: String): Flow<List<BackgroundJobDto>> {
+        assertNotEdt("backgroundJobs")
+        backgroundJobsCalls.add(id to directory)
+        return backgroundJobsFlow.getOrPut(id) { MutableSharedFlow(extraBufferCapacity = 8, replay = 1) }
+    }
+
+    override suspend fun cancelBackgroundJob(id: String, directory: String): Boolean {
+        assertNotEdt("cancelBackgroundJob")
+        cancelledBackgroundJobs.add(id to directory)
+        return cancelBackgroundJobResult
+    }
+
+    override suspend fun promoteBackgroundJob(id: String, directory: String): Boolean {
+        assertNotEdt("promoteBackgroundJob")
+        promotedBackgroundJobs.add(id to directory)
+        return promoteBackgroundJobResult
+    }
+
+    // ------ shared agent board ------
+
+    /** The board returned by [sessionBoard] and, unless [resetSessionBoardReturnsConflict], by [resetSessionBoard]. */
+    var board = SessionBoardDto(ownerSessionID = "ses_test", revision = 1, messages = emptyList(), hasMore = false)
+
+    /**
+     * Optional cursor-keyed page sequence for tests that need [sessionBoard] to answer more than one
+     * distinct page across a run (e.g. a full-history export walking several `before` cursors in one
+     * coroutine, faster than the existing single-page tests can drive by mutating [board] between
+     * user-triggered calls). Keyed by the request's `before` value (`null` for the first page); falls
+     * back to [board] for any cursor not present, so every existing single-page test is unaffected.
+     */
+    var boardPages: Map<String?, SessionBoardDto>? = null
+    var sessionBoardThrows: Exception? = null
+    var resetSessionBoardReturnsConflict = false
+    var resetSessionBoardThrows: Exception? = null
+    val sessionBoardCalls = mutableListOf<Triple<String, String?, Int?>>()
+    val resetSessionBoardCalls = mutableListOf<Pair<String, Int>>()
+
+    override suspend fun sessionBoard(sessionID: String, directory: String, before: String?, limit: Int?): SessionBoardDto {
+        assertNotEdt("sessionBoard")
+        sessionBoardThrows?.let { throw it }
+        sessionBoardCalls.add(Triple(sessionID, before, limit))
+        return boardPages?.get(before) ?: board
+    }
+
+    override suspend fun resetSessionBoard(sessionID: String, directory: String, revision: Int): SessionBoardDto? {
+        assertNotEdt("resetSessionBoard")
+        resetSessionBoardThrows?.let { throw it }
+        resetSessionBoardCalls.add(sessionID to revision)
+        if (resetSessionBoardReturnsConflict) return null
+        return board
     }
 
     private fun key(part: String, name: String, url: String): String {

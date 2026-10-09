@@ -5,6 +5,7 @@ import { InstanceRef, WorkspaceRef } from "@/effect/instance-ref"
 import { GlobalBus } from "@/bus/global"
 import { EventManifest } from "@/event-manifest" // kilocode_change
 import * as EventWire from "@/kilocode/event-wire" // kilocode_change
+import { batch } from "@/kilocode/event-v2-bridge" // kilocode_change
 import { EventV2 } from "@opencode-ai/core/event"
 import { Location } from "@opencode-ai/core/location"
 import { Project } from "@opencode-ai/core/project"
@@ -46,13 +47,24 @@ export const layer = Layer.effect(
           directory: event.location?.directory ?? ctx?.directory ?? "global", // kilocode_change - instance-less events are tagged "global" on the wire
           project: ctx?.project.id,
           workspace: workspaceID,
-          payload: { id: event.id, type: event.type, properties: data }, // kilocode_change - encoded
+          // kilocode_change start - preserve encoded data and error phase for legacy consumers
+          payload: {
+            id: event.id,
+            type: event.type,
+            properties: data,
+            ...(event.type === "session.error" &&
+              (event.metadata?.phase === "admission" || event.metadata?.phase === "execution") && {
+                metadata: { phase: event.metadata.phase },
+              }),
+          },
+          // kilocode_change end
         })
         if (event.durable === undefined) return
         GlobalBus.emit("event", {
           directory: event.location?.directory ?? ctx?.directory ?? "global", // kilocode_change - instance-less events are tagged "global" on the wire
           project: ctx?.project.id,
           workspace: workspaceID,
+          ...(event.metadata?.fork === true && { [EventWire.copied]: true }), // kilocode_change
           payload: {
             type: "sync",
             syncEvent: {
@@ -68,7 +80,7 @@ export const layer = Layer.effect(
     )
     yield* Effect.addFinalizer(() => unsubscribe)
 
-    return Service.of({ ...events, publish })
+    return Service.of({ ...events, publish, publishAll: batch(events) }) // kilocode_change
   }),
 )
 

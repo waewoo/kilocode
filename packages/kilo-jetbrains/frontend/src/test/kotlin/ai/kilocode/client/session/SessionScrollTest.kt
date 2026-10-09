@@ -1,17 +1,24 @@
 package ai.kilocode.client.session
 
+import ai.kilocode.client.agentManager.worktree.KiloWorktreeService
 import ai.kilocode.client.plugin.KiloBundle
+import ai.kilocode.client.session.model.SessionState
 import ai.kilocode.client.session.ui.ModifiedFilesView
 import ai.kilocode.client.session.ui.SessionMessageListPanel
+import ai.kilocode.client.session.ui.header.BranchDock
+import ai.kilocode.client.session.ui.header.SessionHeaderPanel
 import ai.kilocode.client.session.ui.prompt.PromptPanel
 import ai.kilocode.client.session.ui.selection.SessionCopyTarget
 import ai.kilocode.client.session.ui.style.SessionEditorStyle
 import ai.kilocode.client.session.ui.style.SessionUiStyle
 import ai.kilocode.client.session.views.tool.ShellToolView
 import ai.kilocode.client.session.views.tool.ToolView
+import ai.kilocode.client.testing.FakeWorktreeRpcApi
 import ai.kilocode.client.ui.UiStyle
+import ai.kilocode.rpc.dto.BranchStatusDto
 import ai.kilocode.rpc.dto.ChatEventDto
 import ai.kilocode.rpc.dto.DiffFileDto
+import ai.kilocode.rpc.dto.GhAvailability
 import ai.kilocode.rpc.dto.MessageErrorDto
 import ai.kilocode.rpc.dto.MessageSummaryDto
 import ai.kilocode.rpc.dto.MessageWithPartsDto
@@ -23,6 +30,8 @@ import ai.kilocode.rpc.dto.QuestionRequestDto
 import ai.kilocode.rpc.dto.SessionRevertDto
 import ai.kilocode.rpc.dto.SessionStatusDto
 import ai.kilocode.rpc.dto.ToolRefDto
+import com.intellij.openapi.application.ApplicationManager
+import com.intellij.testFramework.replaceService
 import com.intellij.ui.EditorTextField
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.ui.components.JBRadioButton
@@ -30,9 +39,11 @@ import com.intellij.util.ui.JBUI
 import com.intellij.util.ui.UIUtil
 import java.awt.Container
 import java.awt.Point
+import java.awt.event.MouseEvent
 import javax.swing.AbstractButton
 import javax.swing.JButton
 import javax.swing.JComponent
+import javax.swing.JPanel
 import javax.swing.Scrollable
 import javax.swing.SwingConstants
 import javax.swing.JTextArea
@@ -41,6 +52,66 @@ import kotlinx.coroutines.CompletableDeferred
 
 @Suppress("UnstableApiUsage")
 class SessionScrollTest : SessionUiTestBase() {
+
+    fun `test timeline click reveals the matching transcript part`() {
+        showMessages()
+        fillTranscript(12)
+        val mid = "timeline_message"
+        val pid = "timeline_part"
+        emit(ChatEventDto.MessageUpdated("ses_test", message(mid).copy(role = "assistant")), flush = false)
+        emit(ChatEventDto.PartUpdated("ses_test", part("timeline_first", mid, "text", text(12))), flush = false)
+        emit(ChatEventDto.PartUpdated("ses_test", part(pid, mid, "reasoning", text(13))), flush = false)
+        fillTranscript(24, start = 12)
+
+        val header = find<SessionHeaderPanel>(ui)
+        if (!header.isExpanded()) click(header.expandButton())
+        drainScroll()
+        val timeline = header.timelinePanel()
+        timeline.setSize(timeline.preferredSize)
+        val bar = scrollBar()
+        setBottom(bar)
+        val messages = find<SessionMessageListPanel>(ui)
+        val target = messages.findMessage(mid)!!.part(pid) as JComponent
+        val expected = SwingUtilities.convertPoint(target, Point(0, 0), messages).y
+        assertTrue("target=$expected bottom=${bottom(bar)}", expected < bottom(bar))
+
+        timeline.dispatchEvent(MouseEvent(
+            timeline, MouseEvent.MOUSE_CLICKED, System.currentTimeMillis(), 0,
+            header.timelineBarWidth() + 1, timeline.height - 1, 1, false, MouseEvent.BUTTON1,
+        ))
+        drainScroll()
+
+        assertEquals(expected, bar.value)
+        assertFalse(ui.scroll.following())
+
+        fillTranscript(1, start = 36)
+
+        assertEquals(expected, bar.value)
+        assertFalse(ui.scroll.following())
+    }
+
+    fun `test timeline step finish navigates to its containing message`() {
+        showMessages()
+        fillTranscript(12)
+        val mid = "timeline_message"
+        emit(ChatEventDto.MessageUpdated("ses_test", message(mid).copy(role = "assistant")), flush = false)
+        emit(ChatEventDto.PartUpdated("ses_test", part("timeline_text", mid, "text", text(12))), flush = false)
+        emit(ChatEventDto.PartUpdated("ses_test", part("timeline_finish", mid, "step-finish")), flush = false)
+        fillTranscript(24, start = 12)
+        val bar = scrollBar()
+        setBottom(bar)
+        val messages = find<SessionMessageListPanel>(ui)
+        val target = messages.findMessage(mid)!!
+        assertNull(target.part("timeline_finish"))
+        val expected = SwingUtilities.convertPoint(target, Point(0, 0), messages).y
+        assertTrue(expected < bottom(bar))
+
+        assertTrue(ui.scroll.scrollPart(mid, "timeline_finish"))
+        drainScroll()
+
+        assertEquals(expected, bar.value)
+        assertFalse(ui.scroll.following())
+    }
 
     fun `test session update follows when transcript is at bottom`() {
         showMessages()
@@ -832,6 +903,135 @@ class SessionScrollTest : SessionUiTestBase() {
         assertBottom(scrollBar())
     }
 
+    // The branch dock sits outside the scroll pane, so it hiding on turn start (and reappearing on
+    // turn end) resizes the transcript viewport by its own row height. Bottom-following must survive
+    // both edges.
+
+    fun `test dock hiding on turn start keeps the transcript following`() {
+        val dock = dockSession()
+        val bar = scrollBar()
+        setBottom(bar)
+        drainScroll()
+        assertTrue(dock.isVisible)
+        assertBottom(bar)
+        assertTrue(ui.scroll.following())
+
+        controller().model.setState(SessionState.Busy("running"))
+        drainScroll()
+
+        assertFalse(dock.isVisible)
+        assertBottom(bar)
+        assertTrue(ui.scroll.following())
+    }
+
+    fun `test dock showing on turn end keeps the transcript following`() {
+        val dock = dockSession()
+        val bar = scrollBar()
+        setBottom(bar)
+        controller().model.setState(SessionState.Busy("running"))
+        drainScroll()
+        assertFalse(dock.isVisible)
+
+        controller().model.setState(SessionState.Idle)
+        settle()
+        drainScroll()
+
+        assertTrue(dock.isVisible)
+        assertBottom(bar)
+        assertTrue(ui.scroll.following())
+    }
+
+    // A wheel gesture that moves nothing (already pinned at the bottom) leaves the user-gesture flag
+    // set until the next adjustment event. Without an explicit re-pin the dock's own viewport resize
+    // is that event, and it reads as a deliberate scroll away from the bottom.
+    fun `test dock toggle keeps following after a wheel gesture at the bottom`() {
+        val dock = dockSession()
+        val bar = scrollBar()
+        setBottom(bar)
+        drainScroll()
+        wheelNoop()
+
+        controller().model.setState(SessionState.Busy("running"))
+        drainScroll()
+
+        assertFalse(dock.isVisible)
+        assertBottom(bar)
+        assertTrue(ui.scroll.following())
+
+        wheelNoop()
+        controller().model.setState(SessionState.Idle)
+        settle()
+        drainScroll()
+
+        assertTrue(dock.isVisible)
+        assertBottom(bar)
+        assertTrue(ui.scroll.following())
+    }
+
+    // JViewport notifies the last-registered listener first, and a look and feel change re-installs
+    // the scroll pane UI's own viewport listener after ours. The platform's scrollbar sync then runs
+    // first, so the re-pin must not depend on listener order.
+    fun `test dock toggle keeps following after a look and feel change`() {
+        val dock = dockSession()
+        setBottom(scrollBar())
+        drainScroll()
+        scrollComponent().updateUI()
+        drainScroll()
+        assertTrue(ui.scroll.following())
+        wheelNoop()
+
+        controller().model.setState(SessionState.Busy("running"))
+        drainScroll()
+
+        assertFalse(dock.isVisible)
+        assertBottom(scrollBar())
+        assertTrue(ui.scroll.following())
+    }
+
+    fun `test dock toggle preserves a scrolled-up position`() {
+        val dock = dockSession()
+        val bar = scrollBar()
+        setValue(bar, bottom(bar) / 2)
+        drainScroll()
+        val value = bar.value
+        assertFalse(ui.scroll.following())
+
+        controller().model.setState(SessionState.Busy("running"))
+        drainScroll()
+
+        assertFalse(dock.isVisible)
+        assertEquals(value, bar.value)
+        assertFalse(ui.scroll.following())
+        assertTrue(jumpButton().isVisible)
+
+        controller().model.setState(SessionState.Idle)
+        settle()
+        drainScroll()
+
+        assertTrue(dock.isVisible)
+        assertEquals(value, bar.value)
+        assertFalse(ui.scroll.following())
+        assertTrue(jumpButton().isVisible)
+    }
+
+    fun `test dock appearing at turn end does not break a recovered session open`() {
+        installWorktreeStatus()
+        rpc.history.addAll(history(24))
+        rpc.statuses.value = mapOf("ses_test" to SessionStatusDto("busy"))
+
+        ui = newUi(id = "ses_test")
+        settle()
+        drainScroll()
+        assertBottom(scrollBar())
+
+        emit(ChatEventDto.TurnClose("ses_test", "done"))
+        settle()
+        drainScroll()
+
+        assertTrue(find<BranchDock>(ui).isVisible)
+        assertBottom(scrollBar())
+    }
+
     fun `test replayed event during existing session open cannot cancel initial bottom`() {
         val gate = CompletableDeferred<Unit>()
         rpc.historyGate = gate
@@ -990,6 +1190,48 @@ class SessionScrollTest : SessionUiTestBase() {
 
         assertEquals(value, bar.value)
         assertTrue(jumpButton().isVisible)
+    }
+
+    fun `test hidden question is followed when session is revealed`() {
+        val host = JPanel()
+        host.setSize(800, 600)
+        host.add(ui)
+
+        try {
+            host.addNotify()
+            ui.setSize(800, 600)
+            showMessages()
+            fillTranscript(24)
+            val bar = scrollBar()
+            setValue(bar, bottom(bar) / 2)
+            val value = bar.value
+            drainScroll()
+
+            assertEquals(value, bar.value)
+            assertFalse(ui.scroll.following())
+            assertTrue(jumpButton().isVisible)
+
+            host.remove(ui)
+            UIUtil.dispatchAllInvocationEvents()
+            assertFalse(ui.isShowing)
+
+            emit(ChatEventDto.QuestionAsked("ses_test", question("q_hidden_reveal")))
+            drainScroll()
+
+            assertEquals(value, bar.value)
+            assertFalse("Hidden metadata update alone must not resume following", ui.scroll.following())
+            assertTrue(jumpButton().isVisible)
+
+            host.add(ui)
+            drainScroll()
+
+            assertTrue(ui.isShowing)
+            assertBottom(bar)
+            assertTrue(ui.scroll.following())
+            assertFalse(jumpButton().isVisible)
+        } finally {
+            host.removeNotify()
+        }
     }
 
     fun `test question overlay replaces scroll icon and still jumps to bottom`() {
@@ -1374,6 +1616,27 @@ class SessionScrollTest : SessionUiTestBase() {
         val expected = messageBottomValue("msg_36")
         assertTrue("expected=$expected bottom=${bottom(bar)}", expected < bottom(bar))
         assertTrue("value=${bar.value} expected=$expected", kotlin.math.abs(bar.value - expected) <= 1)
+    }
+
+    /** Serves a branch status the dock accepts, so it really takes a row above the prompt. */
+    private fun installWorktreeStatus() {
+        val worktree = FakeWorktreeRpcApi().apply {
+            branchResult = BranchStatusDto(branch = "main", availability = GhAvailability.OK)
+        }
+        ApplicationManager.getApplication()
+            .replaceService(KiloWorktreeService::class.java, KiloWorktreeService(scope, worktree), testRootDisposable)
+    }
+
+    /** A filled transcript in a session whose branch dock is visible while idle. */
+    private fun dockSession(): BranchDock {
+        installWorktreeStatus()
+        ui = newUi()
+        layout()
+        showMessages()
+        fillTranscript(24)
+        settle()
+        drainScroll()
+        return find(ui)
     }
 
     private fun button(text: String): JButton = findAll<JButton>(ui).first { it.text == text }

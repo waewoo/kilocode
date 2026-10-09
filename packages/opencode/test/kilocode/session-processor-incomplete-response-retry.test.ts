@@ -17,6 +17,7 @@ import { Image } from "../../src/image/image"
 import { KiloSessionProcessor } from "../../src/kilocode/session/processor"
 import { Permission } from "../../src/permission"
 import { Plugin } from "../../src/plugin"
+import { ProviderError } from "../../src/provider/error"
 import type { Provider } from "../../src/provider/provider"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -99,6 +100,18 @@ function success() {
     LLMEvent.textEnd({ id: "text" }),
     LLMEvent.stepFinish({ index: 0, reason: "stop", usage }),
     LLMEvent.finish({ reason: "stop", usage }),
+  ]
+}
+
+function reasoning() {
+  const usage = new Usage({ outputTokens: 8, reasoningTokens: 8, totalTokens: 8 })
+  return [
+    LLMEvent.stepStart({ index: 0 }),
+    LLMEvent.reasoningStart({ id: "reasoning" }),
+    LLMEvent.reasoningDelta({ id: "reasoning", text: "Investigating the problem" }),
+    LLMEvent.reasoningEnd({ id: "reasoning" }),
+    LLMEvent.stepFinish({ index: 0, reason: "unknown", usage }),
+    LLMEvent.finish({ reason: "unknown", usage }),
   ]
 }
 
@@ -309,7 +322,57 @@ describe("session processor incomplete response retry", () => {
     ),
   )
 
-  it.effect("does not retry non-empty reasoning", () =>
+  it.effect("retries reasoning-only unknown responses", () =>
+    provideTmpdirProject(
+      (dir) =>
+        Effect.gen(function* () {
+          const ctx = yield* setup(dir)
+          yield* ctx.test.reply(...reasoning())
+          yield* ctx.test.reply(...success())
+          const delay = spyOn(SessionRetry, "delay").mockReturnValue(0)
+
+          try {
+            expect(yield* ctx.handle.process(ctx.input)).toBe("continue")
+          } finally {
+            delay.mockRestore()
+          }
+
+          expect(yield* ctx.test.calls).toBe(2)
+          expect(ctx.handle.message.finish).toBe("stop")
+          const parts = yield* MessageV2.parts(ctx.msg.id)
+          expect(parts.some((part) => part.type === "reasoning")).toBe(false)
+          expect(parts.find((part) => part.type === "text")?.text).toBe("Recovered")
+        }),
+      { git: true },
+    ),
+  )
+
+  it.effect("bounds reasoning-only unknown retries", () =>
+    provideTmpdirProject(
+      (dir) =>
+        Effect.gen(function* () {
+          const ctx = yield* setup(dir)
+          yield* ctx.test.reply(...reasoning())
+          yield* ctx.test.reply(...reasoning())
+          yield* ctx.test.reply(...reasoning())
+          const delay = spyOn(SessionRetry, "delay").mockReturnValue(0)
+
+          try {
+            expect(yield* ctx.handle.process(ctx.input)).toBe("stop")
+          } finally {
+            delay.mockRestore()
+          }
+
+          expect(yield* ctx.test.calls).toBe(3)
+          expect(ctx.handle.message.finish).toBe("unknown")
+          expect(MessageV2.APIError.isInstance(ctx.handle.message.error)).toBe(true)
+          expect(yield* MessageV2.parts(ctx.msg.id)).toEqual([])
+        }),
+      { git: true },
+    ),
+  )
+
+  it.effect("does not retry reasoning with a deliberate finish", () =>
     provideTmpdirProject(
       (dir) =>
         Effect.gen(function* () {
@@ -317,24 +380,19 @@ describe("session processor incomplete response retry", () => {
           const usage = new Usage({})
           yield* ctx.test.reply(
             LLMEvent.stepStart({ index: 0 }),
-            LLMEvent.reasoningStart({ id: "reasoning-1" }),
-            LLMEvent.reasoningDelta({ id: "reasoning-1", text: "Investigating the problem" }),
-            LLMEvent.reasoningEnd({ id: "reasoning-1" }),
-            LLMEvent.reasoningStart({ id: "reasoning-2" }),
-            LLMEvent.reasoningDelta({ id: "reasoning-2", text: "Preparing the final answer" }),
-            LLMEvent.reasoningEnd({ id: "reasoning-2" }),
-            LLMEvent.stepFinish({ index: 0, reason: "unknown", usage }),
-            LLMEvent.finish({ reason: "unknown", usage }),
+            LLMEvent.reasoningStart({ id: "reasoning" }),
+            LLMEvent.reasoningDelta({ id: "reasoning", text: "Complete reasoning" }),
+            LLMEvent.reasoningEnd({ id: "reasoning" }),
+            LLMEvent.stepFinish({ index: 0, reason: "stop", usage }),
+            LLMEvent.finish({ reason: "stop", usage }),
           )
-          expect(yield* ctx.handle.process(ctx.input)).toBe("continue")
 
+          expect(yield* ctx.handle.process(ctx.input)).toBe("continue")
           expect(yield* ctx.test.calls).toBe(1)
-          expect(ctx.handle.message.finish).toBe("unknown")
-          const parts = yield* MessageV2.parts(ctx.msg.id)
-          expect(parts.filter((part) => part.type === "reasoning").map((part) => part.text)).toEqual([
-            "Investigating the problem",
-            "Preparing the final answer",
-          ])
+          expect(ctx.handle.message.finish).toBe("stop")
+          expect((yield* MessageV2.parts(ctx.msg.id)).find((part) => part.type === "reasoning")?.text).toBe(
+            "Complete reasoning",
+          )
         }),
       { git: true },
     ),
@@ -512,6 +570,82 @@ describe("session processor incomplete response retry", () => {
 
           expect(yield* ctx.test.calls).toBe(4)
           expect(ctx.handle.message.finish).toBe("stop")
+        }),
+      { git: true },
+    ),
+  )
+
+  it.live("finishes opaque reasoning from dropped attempts before each retry", () =>
+    provideTmpdirProject(
+      (dir) =>
+        Effect.gen(function* () {
+          const ctx = yield* setup(dir)
+          const db = yield* Database.Service
+          const seen: { reasoning: number; open: number; completed: boolean }[] = []
+          // Snapshot persisted state as each scripted attempt starts streaming.
+          const snap = Stream.fromEffectDrain(
+            Effect.gen(function* () {
+              const parts = yield* MessageV2.parts(ctx.msg.id)
+              const info = (yield* MessageV2.get({ sessionID: ctx.msg.sessionID, messageID: ctx.msg.id })).info
+              const reasoning = parts.filter((part) => part.type === "reasoning")
+              seen.push({
+                reasoning: reasoning.length,
+                open: reasoning.filter((part) => part.time.end === undefined).length,
+                completed: info.role === "assistant" && info.time.completed !== undefined,
+              })
+            }).pipe(Effect.provideService(Database.Service, db), Effect.orDie),
+          )
+          const drop = (item: string) =>
+            snap.pipe(
+              Stream.concat(
+                Stream.make(
+                  LLMEvent.stepStart({ index: 0 }),
+                  LLMEvent.reasoningStart({ id: "reasoning", providerMetadata: { openai: { itemId: item } } }),
+                ),
+              ),
+              Stream.concat(Stream.fail(new ProviderError.ResponseStreamError("stream dropped"))),
+            )
+          yield* ctx.test.push(drop("rs_1"))
+          yield* ctx.test.push(drop("rs_2"))
+          yield* ctx.test.push(
+            snap.pipe(
+              Stream.concat(
+                Stream.make(
+                  LLMEvent.stepStart({ index: 0 }),
+                  LLMEvent.reasoningStart({ id: "reasoning" }),
+                  LLMEvent.reasoningDelta({ id: "reasoning", text: "Thought" }),
+                  LLMEvent.reasoningEnd({ id: "reasoning" }),
+                  ...success().slice(1),
+                ),
+              ),
+            ),
+          )
+          const delay = spyOn(SessionRetry, "delay").mockReturnValue(0)
+
+          try {
+            expect(yield* ctx.handle.process(ctx.input)).toBe("continue")
+          } finally {
+            delay.mockRestore()
+          }
+
+          expect(yield* ctx.test.calls).toBe(3)
+          expect(seen).toEqual([
+            { reasoning: 0, open: 0, completed: false },
+            { reasoning: 1, open: 0, completed: false },
+            { reasoning: 2, open: 0, completed: false },
+          ])
+          const info = (yield* MessageV2.get({ sessionID: ctx.msg.sessionID, messageID: ctx.msg.id })).info
+          expect(info.role === "assistant" && info.time.completed).toBeNumber()
+          const parts = yield* MessageV2.parts(ctx.msg.id)
+          expect(parts.find((part) => part.type === "text")?.text).toBe("Recovered")
+          const reasoning = parts.filter((part) => part.type === "reasoning")
+          expect(reasoning.map((part) => [part.text, part.metadata])).toEqual([
+            ["", { openai: { itemId: "rs_1" } }],
+            ["", { openai: { itemId: "rs_2" } }],
+            ["Thought", undefined],
+          ])
+          expect(new Set(reasoning.map((part) => part.id)).size).toBe(3)
+          for (const part of reasoning) expect(part.time.end ?? 0).toBeGreaterThanOrEqual(part.time.start)
         }),
       { git: true },
     ),

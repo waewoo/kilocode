@@ -2,11 +2,14 @@ package ai.kilocode.client.session.views
 
 import ai.kilocode.client.session.model.Content
 import ai.kilocode.client.session.model.Tool
+import ai.kilocode.client.session.model.ToolApproval
 import ai.kilocode.client.session.model.ToolExecState
 import ai.kilocode.client.session.model.toolKind
 import ai.kilocode.client.session.ui.style.SessionEditorStyle
 import ai.kilocode.client.session.ui.style.SessionUiStyle
+import ai.kilocode.client.session.views.tool.FileLinkLabel
 import ai.kilocode.client.session.views.tool.ToolView
+import ai.kilocode.client.ui.PlainLabel
 import com.intellij.openapi.editor.DefaultLanguageHighlighterColors
 import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.editor.EditorFactory
@@ -15,6 +18,7 @@ import com.intellij.ui.scale.JBUIScale
 import com.intellij.util.ui.JBUI
 import com.intellij.util.ui.UIUtil
 import java.awt.BorderLayout
+import java.awt.Container
 import javax.swing.JPanel
 import javax.swing.ScrollPaneConstants
 
@@ -98,6 +102,19 @@ class ToolViewTest : BasePlatformTestCase() {
         assertTrue(view.bodyCreated())
     }
 
+    fun `test header without a file link keeps no link label or wrapper in the tree`() {
+        val view = track(ToolView(tool("p1", "bash", ToolExecState.COMPLETED).also {
+            it.input = mapOf("command" to "pwd", "description" to "Print dir")
+        }))
+
+        val header = header(view)
+
+        // The subtitle is the flexible middle directly, not a stack that also carries a hidden link.
+        val middle = (header.layout as BorderLayout).getLayoutComponent(BorderLayout.CENTER) as PlainLabel
+        assertEquals("Print dir", middle.text)
+        assertTrue(descendants(view).none { it is FileLinkLabel })
+    }
+
     fun `test bash tool editor highlights command text`() {
         val t = tool("p1", "bash", ToolExecState.COMPLETED).also {
             it.input = mapOf("command" to "git remote -v", "description" to "View remotes")
@@ -142,6 +159,20 @@ class ToolViewTest : BasePlatformTestCase() {
         assertTrue(view.isExpanded())
         view.toggle()
         assertFalse(view.isExpanded())
+    }
+
+    fun `test expanded tool shows approval footer`() {
+        val t = tool("p1", "bash", ToolExecState.COMPLETED).also {
+            it.input = mapOf("command" to "pwd")
+            it.output = "/tmp"
+            it.approval = ToolApproval(source = "global")
+        }
+        val view = track(ToolView(t))
+
+        view.toggle()
+        view.syncApprovalReason(true)
+
+        assertTrue(texts(view).any { it.contains("Auto-approved by your global config") })
     }
 
     fun `test collapsed bash hides body`() {
@@ -458,10 +489,21 @@ class ToolViewTest : BasePlatformTestCase() {
         assertTrue(font.size < style.editorSize)
     }
 
-    private fun headerGap(view: ToolView): Int {
+    private fun headerGap(view: ToolView): Int = (header(view).layout as BorderLayout).hgap
+
+    private fun header(view: ToolView): JPanel {
         val row = view.components.filterIsInstance<JPanel>().single()
-        val header = (row.layout as BorderLayout).getLayoutComponent(BorderLayout.CENTER) as JPanel
-        return (header.layout as BorderLayout).hgap
+        return (row.layout as BorderLayout).getLayoutComponent(BorderLayout.CENTER) as JPanel
+    }
+
+    private fun descendants(root: Container): List<java.awt.Component> = root.components.flatMap { child ->
+        listOf(child) + ((child as? Container)?.let(::descendants) ?: emptyList())
+    }
+
+    private fun texts(root: Container): List<String> = root.components.flatMap { child ->
+        val own = (child as? javax.swing.JLabel)?.text?.let(::listOf) ?: emptyList()
+        val nested = (child as? Container)?.let(::texts) ?: emptyList()
+        own + nested
     }
 
 }

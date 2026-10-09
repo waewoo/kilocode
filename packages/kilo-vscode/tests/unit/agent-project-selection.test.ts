@@ -19,6 +19,7 @@ function fakeState(persisted?: { current?: unknown }) {
   return {
     getWorktree: (id: string) => (id === "wt1" ? { path: "/repo/prj-extra/wt1" } : undefined),
     getSession: (id: string) => (id === "sess1" ? {} : undefined),
+    moveSession: () => {},
     getActiveTarget: () => store.current,
     setActiveTarget: (target: unknown) => {
       store.current = target
@@ -28,7 +29,6 @@ function fakeState(persisted?: { current?: unknown }) {
 
 function setup(
   opts: {
-    enabled?: boolean
     workspace?: string
     ready?: (ctx: ProjectContext) => Promise<ProjectInitResult>
     state?: () => WorktreeStateManager
@@ -43,7 +43,6 @@ function setup(
   const contexts = new ProjectContexts({
     workspaceRoot: () => opts.workspace ?? WORKSPACE,
     registry,
-    enabled: () => opts.enabled ?? true,
     deps: {
       log: () => {},
       exists: () => true,
@@ -70,14 +69,22 @@ function setup(
   const deps: ProjectMessageDeps = {
     registry: registry as never,
     contexts,
-    enabled: () => opts.enabled ?? true,
     pickFolder: async () => undefined,
+    onboarding: {
+      input: async () => undefined,
+      confirm: async () => false,
+      cloneRepository: async () => undefined,
+      isTrusted: () => true,
+      notify: () => {},
+    },
     activate: (ctx) => calls.activate.push(ctx.id),
     expand: (ctx) => calls.expand.push(ctx.id),
     push: () => calls.push++,
     error: (message) => calls.error.push(message),
     ready: readyImpl,
     selected: (target) => calls.selected.push(target.kind === "local" ? target.projectId : target.kind),
+    post: () => {},
+    openSettings: () => {},
     log: () => {},
   }
   return { contexts, deps, calls, extra }
@@ -118,6 +125,53 @@ describe("activateSelection — cross-project selection", () => {
     expect(contexts.active()?.id).toBe(extra)
     expect(calls.ready).toEqual([extra])
     expect(calls.activate).toEqual([extra])
+    expect(calls.selected).toEqual([extra])
+  })
+
+  it.each([true, false])("ignores a superseded selection when readiness completes with ok=%s", async (ok) => {
+    const gate = Promise.withResolvers<void>()
+    const { contexts, deps, calls, extra } = setup({
+      ready: (ctx) =>
+        ctx.ensureReady(async () => {
+          ctx.stateManager()
+          if (!ctx.pinned) await gate.promise
+          return { ok: ctx.pinned || ok, refsFixed: 0 }
+        }),
+    })
+
+    const pending = handleProjectMessage(activateMsg(extra), deps)
+    await handleProjectMessage(activateMsg(PINNED, { kind: "worktree", worktreeId: "wt1" }), deps)
+    expect(calls.selected).toEqual(["worktree"])
+
+    gate.resolve()
+    await pending
+
+    expect(contexts.active()?.id).toBe(PINNED)
+    expect(calls.selected).toEqual(["worktree"])
+    expect(contexts.get(extra)?.peekState()?.getActiveTarget()).toBeUndefined()
+    expect(calls.error).toEqual([])
+  })
+
+  it("keeps a pending selection when a newer click targets an unavailable project", async () => {
+    const gate = Promise.withResolvers<void>()
+    const { contexts, deps, calls, extra } = setup({
+      ready: (ctx) =>
+        ctx.ensureReady(async () => {
+          ctx.stateManager()
+          if (!ctx.pinned) await gate.promise
+          return { ok: true, refsFixed: 0 }
+        }),
+    })
+
+    const pending = handleProjectMessage(activateMsg(extra), deps)
+    await handleProjectMessage(activateMsg("prj-missing"), deps)
+    expect(calls.selected).toEqual([])
+    expect(calls.error.length).toBe(1)
+
+    gate.resolve()
+    await pending
+
+    expect(contexts.active()?.id).toBe(extra)
     expect(calls.selected).toEqual([extra])
   })
 
@@ -169,6 +223,27 @@ describe("activateSelection — cross-project selection", () => {
     expect(contexts.active()?.id).toBe(extra)
     expect(calls.activate).toEqual([])
     expect(calls.selected).toEqual(["worktree"])
+    expect(calls.error).toEqual([])
+  })
+
+  it("pushes moved-session state before acknowledging local activation", async () => {
+    const { contexts, deps, calls, extra } = setup()
+    const ctx = contexts.expand(extra)!
+    ctx.stateManager()
+    await ctx.ensureReady(async () => ({ ok: true, refsFixed: 0 }))
+    contexts.activate(extra)
+
+    const order: string[] = []
+    deps.push = () => order.push("projects")
+    deps.pushState = () => order.push("state")
+    deps.selected = () => order.push("selected")
+
+    await handleProjectMessage(
+      { type: "agentManager.openSessionLocally", projectId: extra, sessionId: "sess1" } as never,
+      deps,
+    )
+
+    expect(order).toEqual(["state", "projects", "projects", "selected"])
     expect(calls.error).toEqual([])
   })
 

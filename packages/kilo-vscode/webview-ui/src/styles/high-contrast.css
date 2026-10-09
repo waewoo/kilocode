@@ -11,7 +11,7 @@ body.vscode-high-contrast-light {
   .feedback-button,
   .startup-error-retry,
   .image-attachment-remove,
-  .prompt-review-chip-remove,
+  .prompt-review-row-remove,
   .session-tab-bar .am-tab-close,
   [data-slot="question-progress-nav"],
   [data-slot="question-collapse-toggle"] {
@@ -73,6 +73,10 @@ body.vscode-high-contrast-light {
       border-color: var(--vscode-contrastBorder, var(--vscode-editorWidget-border));
     }
 
+    [data-slot="permission-input-code"] {
+      border-color: var(--vscode-contrastBorder, var(--vscode-editorWidget-border));
+    }
+
     [data-slot="permission-command-copy"]:focus-visible {
       outline-color: var(--vscode-contrastActiveBorder, var(--vscode-focusBorder));
     }
@@ -100,8 +104,17 @@ body.vscode-high-contrast-light {
     border-color: var(--vscode-contrastBorder, transparent) !important;
   }
 
-  /* Prompt review chips */
-  .prompt-review-chip {
+  .prompt-selector::before {
+    background: var(--vscode-contrastBorder, var(--border-base)) !important;
+  }
+
+  .prompt-selectors .prompt-selector [data-component="button"]:is(:hover, [data-expanded]):not(:disabled) {
+    outline: 1px dashed var(--vscode-contrastActiveBorder, transparent);
+    outline-offset: -1px;
+  }
+
+  /* Prompt review rows */
+  .prompt-review-row {
     border-color: var(--vscode-contrastBorder, var(--vscode-input-border));
   }
 

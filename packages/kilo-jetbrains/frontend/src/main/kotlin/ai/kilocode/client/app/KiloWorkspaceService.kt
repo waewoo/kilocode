@@ -4,17 +4,22 @@ package ai.kilocode.client.app
 
 import ai.kilocode.rpc.KiloWorkspaceRpcApi
 import ai.kilocode.rpc.dto.ConfigTargetDto
+import ai.kilocode.rpc.dto.ConfigDto
+import ai.kilocode.rpc.dto.ConfigPatchDto
 import ai.kilocode.rpc.dto.DiffFileDto
 import ai.kilocode.rpc.dto.FileSearchResultDto
 import ai.kilocode.rpc.dto.KiloWorkspaceStateDto
 import ai.kilocode.rpc.dto.KiloWorkspaceStatusDto
 import ai.kilocode.rpc.dto.LoadErrorDto
 import ai.kilocode.rpc.dto.ModelsWorkspaceDto
+import ai.kilocode.rpc.dto.SetupScriptTargetDto
 import ai.kilocode.rpc.dto.WorkspaceFileDto
+import ai.kilocode.client.util.edt
 import com.intellij.ide.ActivityTracker
 import com.intellij.openapi.components.Service
 import ai.kilocode.log.KiloLog
 import com.intellij.platform.project.ProjectId
+import com.intellij.util.concurrency.annotations.RequiresBackgroundThread
 import fleet.rpc.client.durable
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
@@ -50,7 +55,9 @@ class KiloWorkspaceService internal constructor(
 
     private val workspaces = ConcurrentHashMap<String, Workspace>()
     internal val localConfig = ConcurrentHashMap<String, ConfigTargetDto>()
+    internal val setupScript = ConcurrentHashMap<String, SetupScriptTargetDto>()
     private val pendingLocal = ConcurrentHashMap.newKeySet<String>()
+    private val pendingSetupScript = ConcurrentHashMap.newKeySet<String>()
     private val pendingGlobal = AtomicBoolean(false)
 
     @Volatile
@@ -92,6 +99,29 @@ class KiloWorkspaceService internal constructor(
         return workspace
     }
 
+    suspend fun config(directory: String): ConfigDto? {
+        return try {
+            call { config(directory) }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            LOG.warn("Workspace config load failed for directory=$directory", e)
+            null
+        }
+    }
+
+    fun updateConfigAsync(directory: String, patch: ConfigPatchDto, done: (ConfigDto?) -> Unit): Job = cs.launch {
+        val config = try {
+            call { updateConfig(directory, patch) }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            LOG.warn("Workspace config update failed for directory=$directory", e)
+            null
+        }
+        done(config)
+    }
+
     /**
      * Resolve the real project directory from a hint path.
      *
@@ -99,14 +129,25 @@ class KiloWorkspaceService internal constructor(
      * `/home/.cache/JetBrains/RemoteDev/...`). The backend resolves
      * it to the actual project root on the host.
      */
-    suspend fun resolveProjectDirectory(projectId: ProjectId?, hint: String): String {
+    suspend fun resolveProjectDirectory(projectId: ProjectId?, hint: String): String =
+        resolveProjectDirectoryOrNull(projectId, hint) ?: hint
+
+    /**
+     * Resolves the real project directory, or null when the backend could not be reached or returned
+     * nothing. Unlike [resolveProjectDirectory] this does not fall back to [hint], so callers that
+     * cache the result (e.g. [ProjectRoot]) can retry later instead of caching the synthetic
+     * frontend path forever.
+     */
+    suspend fun resolveProjectDirectoryOrNull(projectId: ProjectId?, hint: String): String? {
         return try {
-            val resolved = call { resolveProjectDirectory(projectId, hint) }
+            val resolved = call { resolveProjectDirectory(projectId, hint) }.takeIf { it.isNotBlank() }
             LOG.info("Resolved project directory: projectId=$projectId hint=$hint -> $resolved")
             resolved
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            LOG.warn("Failed to resolve directory, falling back to hint=$hint", e)
-            hint
+            LOG.warn("Failed to resolve directory for hint=$hint", e)
+            null
         }
     }
 
@@ -119,6 +160,18 @@ class KiloWorkspaceService internal constructor(
                 LOG.warn("workspace reload failed for $directory", e)
             }
         }
+    }
+
+    fun reloadCoreSettings(directory: String, done: (CoreReloadResult) -> Unit = {}): Job = cs.launch {
+        val result = try {
+            if (call { reloadCoreSettings(directory) }) CoreReloadResult.SUCCESS else CoreReloadResult.BUSY
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            LOG.warn("Core settings reload failed for directory=$directory", e)
+            CoreReloadResult.FAILED
+        }
+        edt { done(result) }
     }
 
     suspend fun models(directory: String): ModelsWorkspaceDto {
@@ -165,9 +218,15 @@ class KiloWorkspaceService internal constructor(
      * can surface a retry (a swallowed failure is indistinguishable from "no changes"); pass
      * [patches] = false on the badge path to fetch stats only and skip materializing patch text.
      */
+    @RequiresBackgroundThread
     suspend fun branchDiff(directory: String, patches: Boolean = true): List<DiffFileDto> =
         call { branchDiff(directory, patches) }
 
+    @RequiresBackgroundThread
+    suspend fun localDiff(directory: String, patches: Boolean = true): List<DiffFileDto> =
+        call { localDiff(directory, patches) }
+
+    @RequiresBackgroundThread
     suspend fun branchName(directory: String): String? {
         return try {
             call { branchName(directory) }
@@ -284,4 +343,56 @@ class KiloWorkspaceService internal constructor(
         }
     }
 
+    suspend fun setupScriptTarget(directory: String): SetupScriptTargetDto? {
+        return try {
+            val target = call { this.setupScriptTarget(directory) }
+            setupScript[directory] = target
+            target
+        } catch (e: Exception) {
+            LOG.warn("setup script lookup failed for directory=$directory", e)
+            setupScript[directory]
+        }
+    }
+
+    fun refreshSetupScriptTarget(directory: String): Job? {
+        if (!pendingSetupScript.add(directory)) return null
+
+        return cs.launch {
+            try {
+                setupScriptTarget(directory)
+            } finally {
+                pendingSetupScript.remove(directory)
+                ActivityTracker.getInstance().inc()
+            }
+        }
+    }
+
+    fun openSetupScript(directory: String, done: (Boolean) -> Unit) {
+        cs.launch {
+            val ok = try {
+                call { this.openSetupScript(directory) }
+            } catch (e: Exception) {
+                LOG.warn("setup script open failed for directory=$directory", e)
+                false
+            }
+            done(ok)
+        }
+    }
+
+    /**
+     * Resolves the setup script for [directory] and invokes [found] with it on the EDT, but only
+     * when one is actually configured. Silent no-op otherwise, matching VS Code's behavior of doing
+     * nothing when a worktree has no setup script.
+     */
+    fun ifSetupScriptExists(directory: String, found: (SetupScriptTargetDto) -> Unit): Job = cs.launch {
+        val target = setupScriptTarget(directory)?.takeIf { it.exists } ?: return@launch
+        edt { found(target) }
+    }
+
+}
+
+enum class CoreReloadResult {
+    SUCCESS,
+    BUSY,
+    FAILED,
 }

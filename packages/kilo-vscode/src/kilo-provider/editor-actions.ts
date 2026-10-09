@@ -3,6 +3,8 @@ import { buildPreviewPath, getPreviewCommand, getPreviewDir, parseImage, trimEnt
 import { escapeGlob, isAbsolutePath } from "../path-utils"
 import { validateFiles } from "./file-links"
 import type { DiffVirtualFile, DiffVirtualProvider } from "../DiffVirtualProvider"
+import { isPRReviewComment, parseReview, type PRReviewCommentData } from "../shared/review-comments"
+import { isWebLink, openBrowserLink } from "../browser-links"
 
 type EditorOpenMessage = {
   type?: string
@@ -14,9 +16,22 @@ type EditorOpenMessage = {
   sessionID?: string
 }
 
+function isMarkdownFile(file: string): boolean {
+  return /\.(md|mdx|markdown)$/i.test(file)
+}
+
 function openExternal(url: unknown): void {
   if (typeof url !== "string") return
+  if (!isWebLink(url)) return
   void vscode.env.openExternal(vscode.Uri.parse(url))
+}
+
+function openLink(url: unknown, openIntegrated?: (url: string) => boolean): void {
+  if (typeof url !== "string") return
+  void openBrowserLink(url, openIntegrated ? () => openIntegrated(url) : undefined).catch((err) => {
+    console.error("[Kilo New] KiloProvider: open link failed:", err)
+    void vscode.window.showErrorMessage(err instanceof Error ? err.message : String(err))
+  })
 }
 
 function openDiffVirtual(provider: DiffVirtualProvider | undefined, diff: unknown, initialDiffStyle?: unknown): void {
@@ -24,6 +39,16 @@ function openDiffVirtual(provider: DiffVirtualProvider | undefined, diff: unknow
   const file = diff as DiffVirtualFile
   file.initialDiffStyle = initialDiffStyle === "split" ? "split" : "unified"
   provider.open(file)
+}
+
+function openReview(
+  message: EditorOpenMessage & { comment?: unknown },
+  open?: (comment: PRReviewCommentData, sessionID?: string) => void,
+): void {
+  if (typeof message.content !== "string") return
+  if (message.sessionID !== undefined && typeof message.sessionID !== "string") return
+  const comment = parseReview({ version: 1, comments: [message.comment] }, message.content)?.comments[0]
+  if (comment && isPRReviewComment(comment)) open?.(comment, message.sessionID)
 }
 
 function previewImage(dir: vscode.Uri | undefined, dataUrl: string, filename: string): void {
@@ -72,19 +97,30 @@ export function handleEditorAction(
     filename?: string
     id?: string
     paths?: string[]
+    comment?: unknown
   },
   opts: {
     dir: (sessionID?: string) => string
     diff?: DiffVirtualProvider
+    openMarkdown?: (file: string, sessionID?: string) => boolean
+    openPRComment?: (comment: PRReviewCommentData, sessionID?: string) => void
+    openLink?: (url: string) => boolean
     storage?: vscode.Uri
     post?: (msg: unknown) => void
   },
 ): boolean {
+  if (message.type === "openPRComment") {
+    openReview(message, opts.openPRComment)
+    return true
+  }
   if (message.type === "openFile") {
     // Resolve the directory from the session the file reference was rendered
     // for (when the webview provides it), not whatever session happens to be
     // current — mirrors the validateFiles case below.
-    if (message.filePath) openFile(opts.dir(message.sessionID), message.filePath, message.line, message.column)
+    if (message.filePath) {
+      if (isMarkdownFile(message.filePath) && opts.openMarkdown?.(message.filePath, message.sessionID)) return true
+      openFile(opts.dir(message.sessionID), message.filePath, message.line, message.column)
+    }
     return true
   }
   if (message.type === "openContent") {
@@ -109,6 +145,10 @@ export function handleEditorAction(
   }
   if (message.type === "openExternal") {
     openExternal(message.url)
+    return true
+  }
+  if (message.type === "openWebLink") {
+    openLink(message.url, opts.openLink)
     return true
   }
   if (message.type === "openDiffVirtual") {

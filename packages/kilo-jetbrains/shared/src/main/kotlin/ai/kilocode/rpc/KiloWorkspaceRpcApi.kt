@@ -1,10 +1,13 @@
 package ai.kilocode.rpc
 
 import ai.kilocode.rpc.dto.ConfigTargetDto
+import ai.kilocode.rpc.dto.ConfigDto
+import ai.kilocode.rpc.dto.ConfigPatchDto
 import ai.kilocode.rpc.dto.DiffFileDto
 import ai.kilocode.rpc.dto.FileSearchResultDto
 import ai.kilocode.rpc.dto.KiloWorkspaceStateDto
 import ai.kilocode.rpc.dto.ModelsWorkspaceDto
+import ai.kilocode.rpc.dto.SetupScriptTargetDto
 import ai.kilocode.rpc.dto.WorkspaceFileDto
 import com.intellij.platform.project.ProjectId
 import com.intellij.platform.rpc.RemoteApiProviderService
@@ -43,8 +46,17 @@ interface KiloWorkspaceRpcApi : RemoteApi<Unit> {
     /** Trigger a full reload of workspace data. */
     suspend fun reload(directory: String)
 
+    /** Reload project config, skills, agents, commands, and MCP prompts from disk. */
+    suspend fun reloadCoreSettings(directory: String): Boolean
+
     /** Fetch only the providers and agents needed by Models settings. */
     suspend fun models(directory: String): ModelsWorkspaceDto
+
+    /** Read the effective configuration for [directory]. */
+    suspend fun config(directory: String): ConfigDto
+
+    /** Patch the project configuration for [directory] and return the resulting effective config. */
+    suspend fun updateConfig(directory: String, patch: ConfigPatchDto): ConfigDto
 
     /** Resolve [path] to matching files, scoped primarily to [directory]. */
     suspend fun files(directory: String, path: String): List<WorkspaceFileDto>
@@ -55,13 +67,9 @@ interface KiloWorkspaceRpcApi : RemoteApi<Unit> {
     /** Current uncommitted git changes as a unified diff for @git-changes mentions. */
     suspend fun gitChanges(directory: String): String?
 
-    /**
-     * Committed branch changes compared with the default branch merge-base.
-     *
-     * [patches] = false returns file stats only (additions/deletions/status) and skips materializing
-     * the full patch text — used by the header badge, which only needs counts.
-     */
     suspend fun branchDiff(directory: String, patches: Boolean = true): List<DiffFileDto>
+
+    suspend fun localDiff(directory: String, patches: Boolean = true): List<DiffFileDto>
 
     /** Current git branch name for branch-scoped UI labels. */
     suspend fun branchName(directory: String): String?
@@ -83,4 +91,10 @@ interface KiloWorkspaceRpcApi : RemoteApi<Unit> {
 
     /** Open or create the global config file in the IDE. */
     suspend fun openGlobalConfig(): Boolean
+
+    /** Resolve the worktree setup script target for the repo rooted at [directory]. */
+    suspend fun setupScriptTarget(directory: String): SetupScriptTargetDto
+
+    /** Open or create the worktree setup script in the IDE. */
+    suspend fun openSetupScript(directory: String): Boolean
 }

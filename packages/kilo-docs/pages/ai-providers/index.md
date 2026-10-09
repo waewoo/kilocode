@@ -28,6 +28,7 @@ Major AI companies offering powerful models via API:
 - **[Cloudflare](/docs/ai-providers/cloudflare)** - Workers AI and Cloudflare AI Gateway
 - **[DeepSeek](/docs/ai-providers/deepseek)** - DeepSeek V3., R1
 - **[Mistral](/docs/ai-providers/mistral)** - Mistral Large, Codestral
+- **[Nebius Token Factory](/docs/ai-providers/nebius)** - Model inference on Nebius infrastructure
 - **[Poolside](/docs/ai-providers/poolside)** - Laguna models
 
 ### Local & Self-Hosted
@@ -49,6 +50,7 @@ Route requests through unified APIs with additional features:
 - **[Requesty](/docs/ai-providers/requesty)** - Smart routing and fallbacks
 - **[DaoXE](/docs/ai-providers/daoxe)** - Connect multiple model families through one API
 - **[Cloudflare AI Gateway](/docs/ai-providers/cloudflare)** - Route providers through your Cloudflare account
+- **[Eden AI](/docs/ai-providers/edenai)** - EU-based gateway with one key across vendors
 
 ## Choosing a Provider
 

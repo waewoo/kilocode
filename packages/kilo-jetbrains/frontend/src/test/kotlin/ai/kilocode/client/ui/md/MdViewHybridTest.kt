@@ -73,6 +73,18 @@ class MdViewHybridTest : BasePlatformTestCase() {
         assertTrue(view.html().contains("<strong>"))
     }
 
+    fun `test append normalizes crlf split between chunks`() {
+        view.append("```text\nfirst\r")
+        val field = editors().single()
+
+        view.append("\nsecond\r\n")
+        view.append("```")
+
+        assertSame(field, editors().single())
+        assertEquals("first\nsecond", field.document.text)
+        assertEquals("```text\nfirst\r\nsecond\r\n```", view.markdown())
+    }
+
     fun `test fenced code block shows horizontal scrollbar as needed`() {
         view.set("```kotlin\nval value = 1\n```")
         val pane = scrolls().single()
@@ -154,6 +166,17 @@ class MdViewHybridTest : BasePlatformTestCase() {
         assertEquals("val one = 1\nval two = 2\nval three = 3", editor.text)
         assertEquals(editor.preferredSize.height + ins.top + ins.bottom + pad.top + pad.bottom + bar, pane.preferredSize.height)
         assertTrue(pane.preferredSize.height >= line * 3)
+    }
+
+    fun `test fenced code block normalizes mixed line separators`() {
+        val markdown = "```java\nList.of(\"a\", \"b\");\r\n\n  Line two\r\n```"
+
+        view.set(markdown)
+
+        val text = editors().single().document.text
+        assertEquals("List.of(\"a\", \"b\");\n\n  Line two", text)
+        assertFalse(text.contains('\r'))
+        assertEquals(markdown, view.markdown())
     }
 
     fun `test fenced code block balances content padding with horizontal scrollbar`() {
@@ -342,6 +365,27 @@ class MdViewHybridTest : BasePlatformTestCase() {
 
         assertTrue(html.contains("href=\"kilocode/session/prompt.ts:302\">kilocode/session/prompt.ts:302</a>,"))
         assertTrue(html.contains("href=\"native-plan-prompt.txt:37-38\">native-plan-prompt.txt:37-38</a>."))
+    }
+
+    fun `test inline code url renders a live anchor that dispatches link events`() {
+        val received = mutableListOf<MdView.LinkEvent>()
+        view.addLinkListener { received.add(it) }
+        view.set("Release PR: `https://example.com/pull/13524`")
+        val pane = htmls().single()
+        val iter = (pane.document as HTMLDocument).getIterator(HTML.Tag.A)
+
+        assertTrue("code span url must render as an anchor", iter.isValid)
+        assertEquals("https://example.com/pull/13524", iter.attributes.getAttribute(HTML.Attribute.HREF))
+
+        val event = HyperlinkEvent(
+            pane,
+            HyperlinkEvent.EventType.ACTIVATED,
+            URI("https://example.com/pull/13524").toURL(),
+            "https://example.com/pull/13524",
+        )
+        pane.hyperlinkListeners.forEach { it.hyperlinkUpdate(event) }
+
+        assertEquals("https://example.com/pull/13524", received.single().href)
     }
 
     fun `test existing links are not nested as file refs`() {

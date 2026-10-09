@@ -3,6 +3,7 @@ package ai.kilocode.client.session.ui.header
 import ai.kilocode.client.plugin.KiloBundle
 import ai.kilocode.client.session.model.Reasoning
 import ai.kilocode.client.session.model.StepFinish
+import ai.kilocode.client.session.model.TimelineItem
 import ai.kilocode.client.session.model.Tool
 import ai.kilocode.client.session.model.ToolExecState
 import ai.kilocode.client.session.model.ToolKind
@@ -126,68 +127,27 @@ class SessionHeaderPanelTest : SessionControllerTestBase() {
         assertEquals(1, rpc.compacts.size)
     }
 
-    fun `test branch changes badge shows count stats and hides when empty`() {
+    fun `test board button visibility follows the boardVisible callback`() {
         val c = promptedHeader()
-        val panel = SessionHeaderPanel(c, parent)
+        var visible = false
+        val panel = SessionHeaderPanel(c, parent, boardVisible = { visible })
 
-        assertFalse(panel.changesVisible())
+        assertFalse(panel.boardButton().isVisible)
 
-        panel.setBranchChanges(listOf(
-            DiffFileDto("src/A.kt", 2, 1),
-            DiffFileDto("src/B.kt", 0, 3),
-            DiffFileDto("src/C.kt", 5, 0),
-        ))
+        visible = true
+        panel.update(c.model.header)
 
-        assertTrue(panel.changesVisible())
-        assertEquals("3 files", panel.changesText())
-        assertEquals(7 to 4, panel.changesStat())
-
-        panel.setBranchChanges(emptyList())
-
-        assertFalse(panel.changesVisible())
+        assertTrue(panel.boardButton().isVisible)
     }
 
-    fun `test branch changes badge invokes callback when clicked`() {
+    fun `test board button click invokes onShowBoard`() {
         val c = promptedHeader()
         var opened = 0
-        val panel = SessionHeaderPanel(c, parent) { opened++ }
-        val badge = panel.changesBadge()
+        val panel = SessionHeaderPanel(c, parent, boardVisible = { true }, onShowBoard = { opened++ })
 
-        panel.setBranchChanges(listOf(DiffFileDto("src/A.kt", 2, 1)))
-
-        assertTrue(badge.isVisible)
-        assertEquals(KiloBundle.message("diff.editor.branch.tooltip"), badge.toolTipText)
-        assertEquals(KiloBundle.message("diff.editor.branch.tooltip"), badge.accessibleContext.accessibleName)
-
-        click(badge)
+        panel.boardButton().doClick()
 
         assertEquals(1, opened)
-    }
-
-    fun `test branch changes badge is hidden without files even with callback`() {
-        val c = promptedHeader()
-        val panel = SessionHeaderPanel(c, parent) {}
-
-        assertFalse(panel.changesVisible())
-    }
-
-    fun `test branch changes badge no-op update does not repaint`() {
-        val c = promptedHeader()
-        val panel = SessionHeaderPanel(c, parent)
-        val files = listOf(DiffFileDto("src/A.kt", 2, 1))
-        panel.setBranchChanges(files)
-        val prev = RepaintManager.currentManager(panel)
-        val tracker = TrackingRepaintManager(panel.changesBadge())
-
-        try {
-            RepaintManager.setCurrentManager(tracker)
-            panel.setBranchChanges(files)
-
-            assertTrue(tracker.dirty.isEmpty())
-            assertTrue(tracker.invalid.isEmpty())
-        } finally {
-            RepaintManager.setCurrentManager(prev)
-        }
     }
 
     fun `test clicking session title toggles expansion`() {
@@ -203,17 +163,79 @@ class SessionHeaderPanelTest : SessionControllerTestBase() {
         assertFalse(panel.isExpanded())
     }
 
-    fun `test top row places expand center group and right controls`() {
+    fun `test top row places expand title and right controls`() {
         val c = promptedHeader()
         val panel = SessionHeaderPanel(c, parent)
         val top = panel.expandButton().parent
         val layout = top.layout as java.awt.BorderLayout
 
         assertSame(panel.expandButton(), layout.getLayoutComponent(java.awt.BorderLayout.WEST))
-        assertSame(panel.centerGroupPanel(), layout.getLayoutComponent(java.awt.BorderLayout.CENTER))
+        assertSame(panel.titleLabel(), layout.getLayoutComponent(java.awt.BorderLayout.CENTER))
         assertSame(panel.rightPanel(), layout.getLayoutComponent(java.awt.BorderLayout.EAST))
-        assertSame(panel.centerGroupPanel(), panel.changesBadge().parent)
         assertSame(panel.rightPanel(), panel.compactButton().parent)
+    }
+
+    fun `test agents strip stays hidden for a session with no background agents`() {
+        val c = promptedHeader()
+        val panel = SessionHeaderPanel(c, parent)
+
+        // Never had a background agent, so the model fires no BackgroundAgentsUpdated event at all —
+        // the strip must still be hidden rather than showing an empty row.
+        assertTrue(panel.isVisible)
+        assertTrue(panel.todoVisible())
+        assertFalse(panel.agentStripPanel().isVisible)
+    }
+
+    fun `test agents strip hides again once the last agent is cleared`() {
+        val c = promptedHeader()
+        val panel = SessionHeaderPanel(c, parent)
+
+        edt {
+            c.model.setBackgroundAgents(
+                listOf(
+                    ai.kilocode.client.session.background.BackgroundAgent(
+                        job = "job1",
+                        session = "ses_child1",
+                        title = "Explore",
+                        status = ai.kilocode.client.session.background.BackgroundAgentStatus.RUNNING,
+                    ),
+                ),
+            )
+        }
+        assertTrue(panel.agentStripPanel().isVisible)
+
+        edt { c.model.setBackgroundAgents(emptyList()) }
+
+        assertFalse(panel.agentStripPanel().isVisible)
+    }
+
+    fun `test stats body opens directly below the title row and above the strips`() {
+        val c = promptedHeader()
+        val panel = SessionHeaderPanel(c, parent)
+        val layout = panel.layout as java.awt.BorderLayout
+
+        click(panel.expandButton())
+        assertTrue(panel.isExpanded())
+
+        val south = layout.getLayoutComponent(java.awt.BorderLayout.SOUTH)
+
+        // Title row, then the expandable stats body, then the always-visible strips.
+        assertSame(panel.expandButton().parent, layout.getLayoutComponent(java.awt.BorderLayout.NORTH))
+        assertSame(panel.bodyComponents().first().parent, layout.getLayoutComponent(java.awt.BorderLayout.CENTER))
+        assertTrue(javax.swing.SwingUtilities.isDescendingFrom(panel.todoRowPanel(), south))
+        assertTrue(javax.swing.SwingUtilities.isDescendingFrom(panel.agentStripPanel(), south))
+    }
+
+    fun `test strips stay attached below the title row while the stats body is collapsed`() {
+        val c = promptedHeader()
+        val panel = SessionHeaderPanel(c, parent)
+        val layout = panel.layout as java.awt.BorderLayout
+        val south = layout.getLayoutComponent(java.awt.BorderLayout.SOUTH)
+
+        assertFalse(panel.isExpanded())
+        assertNull(layout.getLayoutComponent(java.awt.BorderLayout.CENTER))
+        assertTrue(javax.swing.SwingUtilities.isDescendingFrom(panel.todoRowPanel(), south))
+        assertTrue(panel.todoVisible())
     }
 
     fun `test todo list starts collapsed and toggles independently`() {
@@ -523,9 +545,35 @@ class SessionHeaderPanelTest : SessionControllerTestBase() {
         assertEquals(panel.timelineBarWidth(), next - first)
     }
 
+    fun `test timeline navigates only on a left click inside a bar`() {
+        val c = promptedHeader()
+        val navigated = mutableListOf<TimelineItem>()
+        val panel = SessionHeaderPanel(c, parent, onNavigate = { navigated.add(it) })
+        val timeline = panel.timelinePanel()
+        timeline.setSize(timeline.preferredSize)
+        val x = panel.timelineBarWidth() + 1
+        val y = timeline.height - 1
+
+        for ((at, button) in listOf(x to MouseEvent.BUTTON3, (panel.timelineBarWidth() - 1) to MouseEvent.BUTTON1)) {
+            timeline.dispatchEvent(MouseEvent(
+                timeline, MouseEvent.MOUSE_CLICKED, System.currentTimeMillis(), 0,
+                at, y, 1, false, button,
+            ))
+        }
+        assertTrue(navigated.isEmpty())
+
+        timeline.dispatchEvent(MouseEvent(
+            timeline, MouseEvent.MOUSE_CLICKED, System.currentTimeMillis(), 0,
+            x, y, 1, false, MouseEvent.BUTTON1,
+        ))
+
+        assertEquals(listOf(c.model.header.timeline[1]), navigated)
+    }
+
     fun `test timeline drags horizontally inside viewport`() {
         val c = promptedHeader()
-        val panel = SessionHeaderPanel(c, parent)
+        val navigated = mutableListOf<TimelineItem>()
+        val panel = SessionHeaderPanel(c, parent, onNavigate = { navigated.add(it) })
         repeat(12) { idx ->
             emit(ChatEventDto.PartUpdated("ses_test", tool("tool_more_$idx", "bash", "running", "More $idx")), flush = false)
         }
@@ -560,6 +608,22 @@ class SessionHeaderPanelTest : SessionControllerTestBase() {
 
         assertTrue(panel.timelineViewport().viewPosition.x > x)
         assertEquals(y, panel.timelineViewport().viewPosition.y)
+
+        for (event in listOf(MouseEvent.MOUSE_RELEASED, MouseEvent.MOUSE_CLICKED)) {
+            timeline.dispatchEvent(MouseEvent(
+                timeline, event, System.currentTimeMillis(), 0,
+                panel.timelineBarWidth() + 1, timeline.height - 1, 1, false, MouseEvent.BUTTON1,
+            ))
+        }
+        assertTrue(navigated.isEmpty())
+
+        for (event in listOf(MouseEvent.MOUSE_PRESSED, MouseEvent.MOUSE_RELEASED, MouseEvent.MOUSE_CLICKED)) {
+            timeline.dispatchEvent(MouseEvent(
+                timeline, event, System.currentTimeMillis(), 0,
+                panel.timelineBarWidth() + 1, timeline.height - 1, 1, false, MouseEvent.BUTTON1,
+            ))
+        }
+        assertEquals(listOf(c.model.header.timeline[1]), navigated)
     }
 
     fun `test timeline touch scrolls horizontally inside viewport`() {

@@ -2,11 +2,14 @@ package ai.kilocode.backend.app
 
 import ai.kilocode.backend.testing.TestLog
 import ai.kilocode.rpc.dto.ChatEventDto
+import ai.kilocode.rpc.dto.MessageErrorDto
+import ai.kilocode.rpc.dto.PartDto
 import ai.kilocode.rpc.dto.PermissionRequestDto
 import ai.kilocode.rpc.dto.QuestionInfoDto
 import ai.kilocode.rpc.dto.QuestionRequestDto
 import ai.kilocode.rpc.dto.SessionActivityKindDto
 import ai.kilocode.rpc.dto.SessionStatusDto
+import ai.kilocode.rpc.dto.ToolRefDto
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -34,7 +37,14 @@ class KiloBackendActivityManagerTest {
         scope.cancel()
     }
 
-    private fun start() = manager.start(statuses, { directories[it] }, events)
+    /**
+     * Starts the manager and waits until its event collector has subscribed. [events] has no
+     * replay, so an emit before that point is silently discarded and the test hangs.
+     */
+    private suspend fun start() {
+        manager.start(statuses, { directories[it] }, events)
+        withTimeout(5_000) { events.subscriptionCount.first { it > 0 } }
+    }
 
     @Test
     fun `busy status with known directory emits running activity`() = runBlocking {
@@ -48,7 +58,7 @@ class KiloBackendActivityManagerTest {
     }
 
     @Test
-    fun `permission asked overlays running and reply reverts`() = runBlocking {
+    fun `permission asked overlays running and reply reverts`() = runBlocking<Unit> {
         directories["ses_1"] = "/repo/wt"
         statuses.value = mapOf("ses_1" to SessionStatusDto("busy"))
         start()
@@ -62,7 +72,96 @@ class KiloBackendActivityManagerTest {
     }
 
     @Test
-    fun `question kinds distinguish plain and plan followup`() = runBlocking {
+    fun `explicit resolution clears only its matching permission without a reply event`() = runBlocking<Unit> {
+        directories["ses_1"] = "/repo/wt"
+        directories["ses_barrier"] = "/repo/wt"
+        statuses.value = mapOf("ses_1" to SessionStatusDto("busy"))
+        start()
+
+        events.emit(ChatEventDto.PermissionAsked("ses_1", permission("perm_1", "ses_1", "call_1")))
+        events.emit(ChatEventDto.PermissionAsked("ses_1", permission("perm_2", "ses_1", "call_1")))
+        await("ses_1", SessionActivityKindDto.PERMISSION)
+        events.emit(ChatEventDto.Error("ses_barrier"))
+        await("ses_barrier", SessionActivityKindDto.ERROR)
+
+        manager.resolve("perm_1")
+        assertEquals(SessionActivityKindDto.PERMISSION, manager.activity.value["ses_1"]?.kind)
+        manager.resolve("perm_2")
+        await("ses_1", SessionActivityKindDto.RUNNING)
+    }
+
+    @Test
+    fun `explicit resolution suppresses an asked event still queued behind its reply`() = runBlocking<Unit> {
+        directories["ses_1"] = "/repo/wt"
+        directories["ses_barrier"] = "/repo/wt"
+        statuses.value = mapOf("ses_1" to SessionStatusDto("busy"))
+        start()
+
+        manager.resolve("perm_1")
+        events.emit(ChatEventDto.PermissionAsked("ses_1", permission("perm_1", "ses_1", "call_1")))
+        events.emit(ChatEventDto.Error("ses_barrier"))
+        await("ses_barrier", SessionActivityKindDto.ERROR)
+
+        assertEquals(SessionActivityKindDto.RUNNING, manager.activity.value["ses_1"]?.kind)
+    }
+
+    @Test
+    fun `running question tool remains pending until it completes`() = runBlocking<Unit> {
+        directories["ses_1"] = "/repo/wt"
+        directories["ses_barrier"] = "/repo/wt"
+        statuses.value = mapOf("ses_1" to SessionStatusDto("busy"))
+        start()
+
+        events.emit(ChatEventDto.QuestionAsked("ses_1", question("q_1", "ses_1", tool = ToolRefDto("msg_1", "call_1"))))
+        await("ses_1", SessionActivityKindDto.QUESTION)
+
+        events.emit(tool("ses_1", "call_1", "running"))
+        events.emit(ChatEventDto.Error("ses_barrier"))
+        await("ses_barrier", SessionActivityKindDto.ERROR)
+        assertEquals(SessionActivityKindDto.QUESTION, manager.activity.value["ses_1"]?.kind)
+
+        events.emit(tool("ses_1", "call_1", "completed"))
+        await("ses_1", SessionActivityKindDto.RUNNING)
+    }
+
+    @Test
+    fun `turn close clears a permission even without an idle event`() = runBlocking<Unit> {
+        directories["ses_1"] = "/repo/wt"
+        statuses.value = mapOf("ses_1" to SessionStatusDto("busy"))
+        start()
+
+        events.emit(ChatEventDto.PermissionAsked("ses_1", PermissionRequestDto("perm_1", "ses_1", "edit", emptyList())))
+        await("ses_1", SessionActivityKindDto.PERMISSION)
+
+        events.emit(ChatEventDto.TurnClose("ses_1", "completed"))
+
+        await("ses_1", SessionActivityKindDto.RUNNING)
+    }
+
+    @Test
+    fun `completed turn clears tool-less ordinary question but preserves plan followup`() = runBlocking<Unit> {
+        directories["ses_plain"] = "/repo/a"
+        directories["ses_plan"] = "/repo/b"
+        statuses.value = mapOf(
+            "ses_plain" to SessionStatusDto("busy"),
+            "ses_plan" to SessionStatusDto("busy"),
+        )
+        start()
+
+        events.emit(ChatEventDto.QuestionAsked("ses_plain", question("q_plain", "ses_plain")))
+        events.emit(ChatEventDto.QuestionAsked("ses_plan", question("q_plan", "ses_plan", plan = true)))
+        await("ses_plain", SessionActivityKindDto.QUESTION)
+        await("ses_plan", SessionActivityKindDto.PLAN)
+
+        events.emit(ChatEventDto.TurnClose("ses_plan", "completed"))
+        events.emit(ChatEventDto.TurnClose("ses_plain", "completed"))
+
+        await("ses_plain", SessionActivityKindDto.RUNNING)
+        assertEquals(SessionActivityKindDto.PLAN, manager.activity.value["ses_plan"]?.kind)
+    }
+
+    @Test
+    fun `question kinds distinguish plain and plan followup`() = runBlocking<Unit> {
         directories["ses_plain"] = "/repo/a"
         directories["ses_plan"] = "/repo/b"
         start()
@@ -87,6 +186,127 @@ class KiloBackendActivityManagerTest {
 
         withTimeout(5_000) { manager.activity.first { "ses_1" !in it } }
         assertFalse("ses_1" in manager.activity.value)
+    }
+
+    @Test
+    fun `error persists through idle and clears on next turn`() = runBlocking {
+        directories["ses_1"] = "/repo/wt"
+        statuses.value = mapOf("ses_1" to SessionStatusDto("busy"))
+        start()
+
+        // Turn ends on an error: the session goes idle but the error must stay visible.
+        events.emit(ChatEventDto.Error("ses_1"))
+        statuses.value = mapOf("ses_1" to SessionStatusDto("idle"))
+        events.emit(ChatEventDto.SessionIdle("ses_1"))
+        await("ses_1", SessionActivityKindDto.ERROR)
+
+        // A new turn clears the error.
+        events.emit(ChatEventDto.TurnOpen("ses_1"))
+        withTimeout(5_000) { manager.activity.first { "ses_1" !in it } }
+        assertFalse("ses_1" in manager.activity.value)
+    }
+
+    /**
+     * A provider that ends the response in error writes the failure onto the message and reports it
+     * only through the close reason, so the badge cannot depend on a session error event.
+     */
+    @Test
+    fun `turn closing in error badges the session without an error event`() = runBlocking {
+        directories["ses_1"] = "/repo/wt"
+        statuses.value = mapOf("ses_1" to SessionStatusDto("busy"))
+        start()
+
+        events.emit(ChatEventDto.TurnClose("ses_1", "error"))
+        statuses.value = mapOf("ses_1" to SessionStatusDto("idle"))
+        events.emit(ChatEventDto.SessionIdle("ses_1"))
+
+        val snap = await("ses_1", SessionActivityKindDto.ERROR)
+        assertEquals("/repo/wt", snap["ses_1"]?.directory)
+    }
+
+    @Test
+    fun `turn closing without a failure leaves the session unbadged`() = runBlocking {
+        directories["ses_1"] = "/repo/wt"
+        statuses.value = mapOf("ses_1" to SessionStatusDto("busy"))
+        start()
+
+        for (reason in listOf("completed", "interrupted", "aborted")) {
+            events.emit(ChatEventDto.TurnClose("ses_1", reason))
+        }
+        statuses.value = mapOf("ses_1" to SessionStatusDto("idle"))
+        events.emit(ChatEventDto.SessionIdle("ses_1"))
+
+        withTimeout(5_000) { manager.activity.first { "ses_1" !in it } }
+        assertFalse("ses_1" in manager.activity.value)
+    }
+
+    @Test
+    fun `a turn closed in error clears once the session is retried`() = runBlocking {
+        directories["ses_1"] = "/repo/wt"
+        start()
+
+        events.emit(ChatEventDto.TurnClose("ses_1", "error"))
+        await("ses_1", SessionActivityKindDto.ERROR)
+
+        events.emit(ChatEventDto.TurnOpen("ses_1"))
+
+        withTimeout(5_000) { manager.activity.first { "ses_1" !in it } }
+        assertFalse("ses_1" in manager.activity.value)
+    }
+
+    @Test
+    fun `aborted error does not badge the session`() = runBlocking {
+        directories["ses_1"] = "/repo/wt"
+        statuses.value = mapOf("ses_1" to SessionStatusDto("busy"))
+        start()
+        await("ses_1", SessionActivityKindDto.RUNNING)
+
+        events.emit(ChatEventDto.Error("ses_1", MessageErrorDto(MessageErrorDto.ABORTED, "aborted")))
+        statuses.value = mapOf("ses_1" to SessionStatusDto("idle"))
+        events.emit(ChatEventDto.SessionIdle("ses_1"))
+
+        withTimeout(5_000) { manager.activity.first { "ses_1" !in it } }
+        assertFalse("ses_1" in manager.activity.value)
+    }
+
+    @Test
+    fun `busy outranks a pending provider error so a resumed session runs`() = runBlocking<Unit> {
+        directories["ses_1"] = "/repo/wt"
+        start()
+
+        events.emit(ChatEventDto.Error("ses_1", MessageErrorDto("APIError", "Provider failed")))
+        await("ses_1", SessionActivityKindDto.ERROR)
+
+        // Resumed: busy arrives before anything clears the error.
+        statuses.value = mapOf("ses_1" to SessionStatusDto("busy"))
+
+        await("ses_1", SessionActivityKindDto.RUNNING)
+    }
+
+    @Test
+    fun `busy status event clears a pending error`() = runBlocking {
+        directories["ses_1"] = "/repo/wt"
+        start()
+
+        events.emit(ChatEventDto.Error("ses_1"))
+        await("ses_1", SessionActivityKindDto.ERROR)
+
+        events.emit(ChatEventDto.SessionStatusChanged("ses_1", SessionStatusDto("busy")))
+
+        withTimeout(5_000) { manager.activity.first { "ses_1" !in it } }
+        assertFalse("ses_1" in manager.activity.value)
+    }
+
+    @Test
+    fun `global error without session is ignored`() = runBlocking {
+        directories["ses_1"] = "/repo/wt"
+        start()
+
+        events.emit(ChatEventDto.Error(null))
+        events.emit(ChatEventDto.QuestionAsked("ses_1", question("q_1", "ses_1")))
+
+        val snap = await("ses_1", SessionActivityKindDto.QUESTION)
+        assertEquals(1, snap.size)
     }
 
     @Test
@@ -120,11 +340,95 @@ class KiloBackendActivityManagerTest {
         assertEquals("/repo/new", snap["ses_new"]?.directory)
     }
 
+    @Test
+    fun `interrupt badges the session as failed`() = runBlocking<Unit> {
+        directories["ses_1"] = "/repo/wt"
+        statuses.value = mapOf("ses_1" to SessionStatusDto("busy"))
+        start()
+
+        manager.interrupt(listOf("ses_1"))
+        statuses.value = mapOf("ses_1" to SessionStatusDto("idle"))
+
+        await("ses_1", SessionActivityKindDto.ERROR)
+    }
+
+    /**
+     * The disposal that cancels a turn reloads the app in the same breath, and that reload calls
+     * [KiloBackendActivityManager.start] again. Clearing on that in-place restart erased the badge the
+     * disposal had just recorded, leaving a lost turn resting as if it had finished cleanly.
+     */
+    @Test
+    fun `interrupt badge survives the reload that follows a disposal`() = runBlocking<Unit> {
+        directories["ses_1"] = "/repo/wt"
+        statuses.value = mapOf("ses_1" to SessionStatusDto("busy"))
+        start()
+
+        manager.interrupt(listOf("ses_1"))
+
+        // What load() does after a disposal: same flows, fresh collectors.
+        val reloaded = MutableStateFlow(mapOf("ses_1" to SessionStatusDto("idle")))
+        manager.start(reloaded, { directories[it] }, events)
+
+        await("ses_1", SessionActivityKindDto.ERROR)
+    }
+
+    @Test
+    fun `resumed work clears an interrupt badge`() = runBlocking<Unit> {
+        directories["ses_1"] = "/repo/wt"
+        start()
+        manager.interrupt(listOf("ses_1"))
+        await("ses_1", SessionActivityKindDto.ERROR)
+
+        events.emit(ChatEventDto.TurnOpen("ses_1"))
+        statuses.value = mapOf("ses_1" to SessionStatusDto("busy"))
+
+        await("ses_1", SessionActivityKindDto.RUNNING)
+    }
+
+    /** A real teardown is a disconnect, not a restart, so nothing may outlive it. */
+    @Test
+    fun `stop clears an interrupt badge`() = runBlocking<Unit> {
+        directories["ses_1"] = "/repo/wt"
+        start()
+        manager.interrupt(listOf("ses_1"))
+        await("ses_1", SessionActivityKindDto.ERROR)
+
+        manager.stop()
+
+        assertEquals(emptyMap(), manager.activity.value)
+    }
+
     private suspend fun await(id: String, kind: SessionActivityKindDto) = withTimeout(5_000) {
         manager.activity.first { it[id]?.kind == kind }
     }
 
-    private fun question(id: String, session: String, plan: Boolean = false): QuestionRequestDto {
+    private fun permission(id: String, session: String, call: String) = PermissionRequestDto(
+        id = id,
+        sessionID = session,
+        permission = "edit",
+        patterns = emptyList(),
+        tool = ToolRefDto("msg_1", call),
+    )
+
+    private fun tool(session: String, call: String, state: String) = ChatEventDto.PartUpdated(
+        sessionID = session,
+        part = PartDto(
+            id = "part_$call",
+            sessionID = session,
+            messageID = "msg_1",
+            type = "tool",
+            tool = "edit",
+            callID = call,
+            state = state,
+        ),
+    )
+
+    private fun question(
+        id: String,
+        session: String,
+        plan: Boolean = false,
+        tool: ToolRefDto? = null,
+    ): QuestionRequestDto {
         val info = if (plan) {
             QuestionInfoDto(
                 question = "Ready to implement?",
@@ -135,6 +439,6 @@ class KiloBackendActivityManagerTest {
         } else {
             QuestionInfoDto(question = "Pick one", header = "Choice")
         }
-        return QuestionRequestDto(id = id, sessionID = session, questions = listOf(info))
+        return QuestionRequestDto(id = id, sessionID = session, questions = listOf(info), tool = tool)
     }
 }

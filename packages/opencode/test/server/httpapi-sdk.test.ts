@@ -45,7 +45,7 @@ const original = {
 
 type ServerPath = "default" | "raw"
 type Sdk = ReturnType<typeof createKiloClient>
-type SdkResult = { response: Response; data?: unknown; error?: unknown }
+type SdkResult = { response?: Response; data?: unknown; error?: unknown }
 type Captured = { status: number; data?: unknown; error?: unknown }
 type ProjectFixture = { sdk: Sdk; directory: string }
 type LlmProjectFixture = ProjectFixture & { llm: TestLLMServer["Service"] }
@@ -115,7 +115,7 @@ function call<T>(request: () => Promise<T>) {
 function capture(request: () => Promise<SdkResult>) {
   return call(request).pipe(
     Effect.map((result) => ({
-      status: result.response.status,
+      status: result.response!.status,
       data: result.data,
       error: result.error,
     })),
@@ -132,9 +132,9 @@ function captureThrown(request: () => Promise<unknown>) {
   })
 }
 
-function expectStatus(request: () => Promise<{ response: Response }>, status: number) {
+function expectStatus(request: () => Promise<{ response?: Response }>, status: number) {
   return call(request).pipe(
-    Effect.tap((result) => Effect.sync(() => expect(result.response.status).toBe(status))),
+    Effect.tap((result) => Effect.sync(() => expect(result.response!.status).toBe(status))),
     Effect.asVoid,
   )
 }
@@ -351,12 +351,12 @@ describe("HttpApi SDK", () => {
       const health = yield* call(() => sdk.global.health())
       const log = yield* call(() => sdk.app.log({ service: "httpapi-sdk-test", level: "info", message: "hello" }))
 
-      expect(health.response.status).toBe(200)
+      expect(health.response!.status).toBe(200)
       expect(health.data).toMatchObject({ healthy: true })
       expect(yield* firstEvent((signal) => sdk.global.event({ signal }))).toMatchObject({
         payload: { type: "server.connected" },
       })
-      expect(log.response.status).toBe(200)
+      expect(log.response!.status).toBe(200)
       expect(log.data).toBe(true)
       yield* expectStatus(() => sdk.auth.set({ providerID: "test" }), 400)
     }),
@@ -373,21 +373,21 @@ describe("HttpApi SDK", () => {
         const v2session = yield* call(() => sdk.v2.session.create({ agent: "build" })) // kilocode_change
         const listed = yield* call(() => sdk.session.list({ roots: true, limit: 10 }))
 
-        expect(file.response.status).toBe(200)
+        expect(file.response!.status).toBe(200)
         expect(file.data).toMatchObject({ content: "hello" })
         // kilocode_change start
-        expect(raw.response.status).toBe(200)
+        expect(raw.response!.status).toBe(200)
         const body = raw.data
         if (!body) throw new Error("missing V2 file body")
         const content =
           body instanceof Blob ? yield* Effect.promise(() => body.text()) : Buffer.from(body as unknown as Uint8Array).toString()
         expect(content).toBe("hello")
         // kilocode_change end
-        expect(session.response.status).toBe(200)
+        expect(session.response!.status).toBe(200)
         expect(session.data).toMatchObject({ title: "sdk" })
-        expect({ status: v2session.response.status, error: v2session.error }).toEqual({ status: 200, error: undefined }) // kilocode_change
+        expect({ status: v2session.response!.status, error: v2session.error }).toEqual({ status: 200, error: undefined }) // kilocode_change
         expect(v2session.data).toMatchObject({ data: { location: { directory } } }) // kilocode_change
-        expect(listed.response.status).toBe(200)
+        expect(listed.response!.status).toBe(200)
         expect(listed.data?.map((item) => item.id)).toContain(session.data?.id)
 
         yield* Effect.all([
@@ -417,7 +417,7 @@ describe("HttpApi SDK", () => {
         )
         const url = new URL(request!.url)
 
-        expect(found.response.status).toBe(200)
+        expect(found.response!.status).toBe(200)
         expect(found.data).toMatchObject({ data: [{ path: "hello.txt", type: "file" }] })
         expect(url.searchParams.get("directory")).toBe(directory)
         expect(url.searchParams.get("workspace")).toBe(workspaceID)
@@ -431,7 +431,7 @@ describe("HttpApi SDK", () => {
           headers: { "x-kilo-directory": encodeURIComponent(directory) },
         })
         const legacySession = yield* call(() => legacy.v2.session.create({ agent: "build" }))
-        expect(legacySession.response.status).toBe(200)
+        expect(legacySession.response!.status).toBe(200)
         expect(legacySession.data).toMatchObject({ data: { location: { directory } } })
         // kilocode_change end
       }),
@@ -867,6 +867,72 @@ describe("HttpApi SDK", () => {
         expect(JSON.stringify(messages.data)).not.toContain("oversized.png")
 
         return { promptStatus: prompt.status, persisted: JSON.stringify(messages.data).includes("oversized.png") }
+      }),
+    ),
+  )
+  serverPathParity("reads an SVG attachment as text instead of treating it as an image", (serverPath) =>
+    withProject(serverPath, { config: { attachment: { image: { max_base64_bytes: 4 } } } }, ({ sdk, directory }) =>
+      Effect.gen(function* () {
+        // SVG is relabelled text/plain before resolution, so it leaves the image path entirely:
+        // the image base64 cap (set absurdly low here) no longer governs it, the Read tool does
+        // the reading and limiting, and nothing is persisted as an image/svg+xml file part --
+        // which message-v2 would otherwise forward to the model on this and every later turn.
+        const filepath = path.join(directory, "icon.svg")
+        yield* call(() => Bun.write(filepath, `<svg xmlns="http://www.w3.org/2000/svg">${"x".repeat(2048)}</svg>`))
+        const session = yield* capture(() => sdk.session.create({ title: "svg as text" }))
+        const sessionID = String(record(session.data).id)
+        const prompt = yield* capture(() =>
+          sdk.session.prompt({
+            sessionID,
+            agent: "build",
+            noReply: true,
+            parts: [{ type: "file", mime: "image/svg+xml", filename: "icon.svg", url: `file://${filepath}` }],
+          }),
+        )
+        const messages = yield* capture(() => sdk.session.messages({ sessionID }))
+        const body = JSON.stringify(messages.data)
+
+        expect(prompt.status).toBe(200)
+        expect(body).not.toContain("image/svg+xml")
+        expect(body).toContain("text/plain")
+
+        return { promptStatus: prompt.status, image: body.includes("image/svg+xml") }
+      }),
+    ),
+  )
+  serverPathParity("rejects malformed user image data synchronously through prompt_async", (serverPath) =>
+    withStandardProject(serverPath, ({ sdk }) =>
+      Effect.gen(function* () {
+        // Regression test: prompt_async must reject a bad attachment with a synchronous
+        // 400 instead of returning 204 and failing later with an async session.error,
+        // which left the client with no way to recover the typed message (see prompt.ts
+        // Image.DecodeError handling and the HTTP handler's rejectBadAttachments precheck).
+        const session = yield* capture(() => sdk.session.create({ title: "invalid async image" }))
+        const sessionID = String(record(session.data).id)
+        const prompt = yield* capture(() =>
+          sdk.session.promptAsync({
+            sessionID,
+            agent: "build",
+            noReply: true,
+            parts: [
+              {
+                type: "file",
+                mime: "image/png",
+                filename: "not-an-image.png",
+                url: "data:image/png;base64,bm90LWltYWdl",
+              },
+            ],
+          }),
+        )
+        const messages = yield* capture(() => sdk.session.messages({ sessionID }))
+
+        expect(prompt.status).toBe(400)
+        expect(JSON.stringify(messages.data)).not.toContain("not-an-image.png")
+
+        return {
+          promptStatus: prompt.status,
+          persisted: JSON.stringify(messages.data).includes("not-an-image.png"),
+        }
       }),
     ),
   )

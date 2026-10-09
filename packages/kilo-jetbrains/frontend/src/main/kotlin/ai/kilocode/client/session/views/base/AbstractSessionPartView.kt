@@ -42,6 +42,7 @@ import javax.swing.SwingUtilities
 abstract class AbstractSessionPartView(
     header: JComponent,
     private val makeBody: () -> JComponent,
+    private val makeFooter: (() -> JComponent)? = null,
     expanded: Boolean = false,
     private val expandable: Boolean = true,
     private val compact: Boolean = false,
@@ -53,13 +54,14 @@ abstract class AbstractSessionPartView(
         expanded: Boolean = false,
         expandable: Boolean = true,
         compact: Boolean = false,
-    ) : this(header, { body }, expanded, expandable, compact)
+    ) : this(header, { body }, null, expanded, expandable, compact)
 
     protected val arrow = JBLabel()
     protected val row = Row()
     private val clickable = linkedSetOf<Component>()
     private val watched = linkedSetOf<Component>()
     private var body: JComponent? = null
+    private var footer: JComponent? = null
 
     private val click = object : MouseAdapter() {
         override fun mouseClicked(e: MouseEvent) {
@@ -99,7 +101,7 @@ abstract class AbstractSessionPartView(
         row.add(arrow, BorderLayout.EAST)
         add(row, BorderLayout.NORTH)
         watch(row)
-        if (expanded && expandable) add(body(), BorderLayout.CENTER)
+        if (expanded && expandable) attachBody()
         if (!expandable) syncExpandable(false) else syncArrow()
     }
 
@@ -125,7 +127,7 @@ abstract class AbstractSessionPartView(
     open fun expand(): Boolean {
         if (!expandable) return false
         if (isExpanded()) return false
-        add(body(), BorderLayout.CENTER)
+        attachBody()
         return true
     }
 
@@ -133,6 +135,7 @@ abstract class AbstractSessionPartView(
         val item = body ?: return false
         if (item.parent !== this) return false
         remove(item)
+        footer?.takeIf { it.parent === this }?.let(::remove)
         return true
     }
 
@@ -145,8 +148,16 @@ abstract class AbstractSessionPartView(
         val item = body ?: return false
         val attached = item.parent === this
         if (attached) remove(item)
+        footer?.takeIf { it.parent === this }?.let(::remove)
         body = null
+        footer = null
         return attached
+    }
+
+    protected fun footerHeight(): Int {
+        val item = footer ?: return 0
+        if (!item.isVisible) return 0
+        return expandedGap() + item.preferredSize.height
     }
 
     private fun toggleLocal(): Boolean {
@@ -161,11 +172,22 @@ abstract class AbstractSessionPartView(
     fun syncExpandable(expandable: Boolean): Boolean {
         val active = this.expandable && expandable
         val changed = setVisible(arrow, active)
+        syncArrowSlot(active)
         val detached = if (active) false else collapse()
         val cursor = if (active) Cursor.getPredefinedCursor(Cursor.HAND_CURSOR) else Cursor.getDefaultCursor()
         val moved = syncCursor(cursor)
         val icon = syncArrow()
         return changed || detached || moved || icon
+    }
+
+    /**
+     * Keeps the arrow in the header row only while the card can toggle. A hidden component is still walked by
+     * every tree traversal (graphics-configuration updates on tab switch, component searches during painting),
+     * and most transcript cards never become expandable, so the arrow stays out of the tree until needed.
+     */
+    private fun syncArrowSlot(active: Boolean) {
+        if (active == (arrow.parent === row)) return
+        if (active) row.add(arrow, BorderLayout.EAST) else row.remove(arrow)
     }
 
     protected fun refresh() {
@@ -290,9 +312,21 @@ abstract class AbstractSessionPartView(
         }
     }
 
+    /**
+     * Whether the pointer is still on the row. Bounds alone are not enough: an overlay painted above
+     * the transcript (the connection banner, the modal blocker) owns the pointer while sitting inside
+     * the row's rectangle, and Swing stops delivering to the row without ever leaving it
+     * geometrically. Asking which component is topmost at that point treats a covered row as left, so
+     * the exit clears the hover instead of keeping the row lit — and its popup alive — under the
+     * overlay.
+     */
     private fun inside(e: MouseEvent): Boolean {
         val point = SwingUtilities.convertPoint(e.component, e.point, row)
-        return row.contains(point)
+        if (!row.contains(point)) return false
+        val pane = SwingUtilities.getRootPane(row)?.layeredPane ?: return true
+        val spot = SwingUtilities.convertPoint(e.component, e.point, pane)
+        val top = SwingUtilities.getDeepestComponentAt(pane, spot.x, spot.y) ?: return true
+        return SwingUtilities.isDescendingFrom(top, row)
     }
 
     /**
@@ -338,6 +372,19 @@ abstract class AbstractSessionPartView(
         val item = body
         if (item != null) return item
         return makeBody().also { body = it }
+    }
+
+    private fun attachBody() {
+        add(body(), BorderLayout.CENTER)
+        val item = footer()
+        if (item != null) add(item, BorderLayout.SOUTH)
+    }
+
+    private fun footer(): JComponent? {
+        val item = footer
+        if (item != null) return item
+        val make = makeFooter ?: return null
+        return make().also { footer = it }
     }
 
     private fun syncCursor(cursor: Cursor): Boolean {

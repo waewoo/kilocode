@@ -472,6 +472,16 @@ const scenarios: Scenario[] = [
       headers: ctx.headers(),
     }))
     .json(404, object, "status"),
+  // kilocode_change start - exercise non-destructive MCP OAuth cancellation
+  http.protected
+    .post("/mcp/{name}/auth/cancel", "mcp.auth.cancel")
+    .mutating()
+    .at((ctx) => ({
+      path: route("/mcp/{name}/auth/cancel", { name: "httpapi-missing" }),
+      headers: ctx.headers(),
+    }))
+    .json(404, object, "status"),
+  // kilocode_change end
   http.protected
     .post("/mcp/{name}/auth/callback", "mcp.auth.callback")
     .at((ctx) => ({
@@ -641,8 +651,12 @@ const scenarios: Scenario[] = [
     .at((ctx) => ({ path: "/experimental/session?roots=false&archived=false", headers: ctx.headers() }))
     .json(200, array),
   http.protected.get("/experimental/capabilities", "experimental.capabilities.get").json(200, (body) => {
-    check(typeof body === "object" && body !== null, "capabilities should be an object")
-    check("backgroundSubagents" in body, "capabilities should report background subagents")
+    // kilocode_change start - background subagents are always available
+    check(
+      typeof body === "object" && body !== null && "backgroundSubagents" in body && body.backgroundSubagents === true,
+      "capabilities should report background subagents as available",
+    )
+    // kilocode_change end
   }),
   http.protected
     .post("/experimental/session/{sessionID}/background", "experimental.session.background")

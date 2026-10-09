@@ -14,15 +14,14 @@ import { isKnownRootSession } from "../navigate"
 export function createProjectSessionsLive(opts: {
   base: () => Record<string, ProjectSessionInfo[]>
   pid: () => string | undefined
-  enabled: () => boolean
   store: () => SessionInfo[]
   managed: () => ManagedSessionState[]
   locals: () => Set<string>
 }) {
-  return createMemo(() => {
+  const sessions = createMemo(() => {
     const base = opts.base()
     const pid = opts.pid()
-    if (!pid || !opts.enabled()) return base
+    if (!pid) return base
     const pushed = base[pid] ?? []
     const store = opts.store()
     if (store.length === 0) return base
@@ -30,7 +29,8 @@ export function createProjectSessionsLive(opts: {
     const live = new Map(store.filter(isKnownRootSession).map((item) => [item.id, item]))
     const merged = pushed.map((item) => {
       const fresh = live.get(item.id)
-      return fresh ? { ...fresh, worktreeId: item.worktreeId } : item
+      const worktreeId = managed.has(item.id) ? managed.get(item.id)! : item.worktreeId
+      return fresh ? { ...fresh, worktreeId } : worktreeId === item.worktreeId ? item : { ...item, worktreeId }
     })
     const known = new Set(pushed.map((item) => item.id))
     const owned = (id: string) => managed.has(id) || opts.locals().has(id)
@@ -39,5 +39,8 @@ export function createProjectSessionsLive(opts: {
       .map((item) => ({ ...item, worktreeId: managed.get(item.id) ?? null }))
     if (extra.length === 0 && merged.every((item, index) => item === pushed[index])) return base
     return { ...base, [pid]: [...merged, ...extra] }
+  })
+  return Object.assign(sessions, {
+    current: () => sessions()[opts.pid() ?? ""] ?? [],
   })
 }

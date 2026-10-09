@@ -1,5 +1,7 @@
 package ai.kilocode.client.session.model
 
+import ai.kilocode.client.session.background.BackgroundAgent
+import ai.kilocode.client.session.background.BackgroundAgents
 import ai.kilocode.rpc.dto.DiffFileDto
 import ai.kilocode.rpc.dto.KiloAppStateDto
 import ai.kilocode.rpc.dto.KiloAppStatusDto
@@ -16,6 +18,7 @@ import ai.kilocode.rpc.dto.PartDto
 import ai.kilocode.rpc.dto.SessionDto
 import ai.kilocode.rpc.dto.SessionRevertDto
 import ai.kilocode.rpc.dto.TodoDto
+import ai.kilocode.rpc.dto.ToolApprovalDto
 import ai.kilocode.rpc.dto.TokensDto
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.util.Disposer
@@ -86,6 +89,13 @@ class SessionModel {
     var todos: List<TodoDto> = emptyList()
         private set
 
+    /** Already dismissal-filtered, already-ordered rows for the background-agents strip. */
+    var backgroundAgents: List<BackgroundAgent> = emptyList()
+        private set
+
+    private var rawBackgroundAgents: List<BackgroundAgent> = emptyList()
+    private var dismissedBackgroundAgents: Set<String> = emptySet()
+
     var compactionCount: Int = 0
         private set
 
@@ -105,6 +115,16 @@ class SessionModel {
 
     @RequiresEdt
     fun content(messageId: String, contentId: String): Content? = entries[messageId]?.parts?.get(contentId)
+
+    /**
+     * Every `task` tool's spawned child session id, in the order the tools first appeared —
+     * insertion order of [entries] and of each [Message.parts] map, both `LinkedHashMap`s. Used to
+     * give the shared agent board a stable per-participant avatar (see
+     * `ai.kilocode.client.session.board.BoardAvatars`), not [childRefs], which is unordered.
+     */
+    @RequiresEdt
+    fun childSessions(): List<String> =
+        entries.values.flatMap { it.parts.values }.filterIsInstance<Tool>().mapNotNull { it.childSessionId }
 
     @RequiresEdt
     fun turns(): Collection<Turn> = turnEntries.values
@@ -321,6 +341,30 @@ class SessionModel {
         updateHeader()
     }
 
+    /** Replace the raw background-agent rows (already parent-filtered by the caller) and re-derive [backgroundAgents]. */
+    @RequiresEdt
+    fun setBackgroundAgents(agents: List<BackgroundAgent>) {
+        rawBackgroundAgents = agents
+        applyBackgroundAgents()
+    }
+
+    /** Hide finished background-agent rows locally. A dismissed job that runs again reappears. */
+    @RequiresEdt
+    fun dismissBackgroundAgents(jobs: Set<String>) {
+        if (jobs.isEmpty()) return
+        dismissedBackgroundAgents = dismissedBackgroundAgents + jobs
+        applyBackgroundAgents()
+    }
+
+    private fun applyBackgroundAgents() {
+        val visible = BackgroundAgents.order(
+            rawBackgroundAgents.filter { BackgroundAgents.visible(it, dismissedBackgroundAgents) },
+        )
+        if (visible == backgroundAgents) return
+        backgroundAgents = visible
+        fire(SessionModelEvent.BackgroundAgentsUpdated(visible))
+    }
+
     @RequiresEdt
     fun markCompacted() {
         compactionCount++
@@ -346,6 +390,9 @@ class SessionModel {
         state = SessionState.Idle
         diff = emptyList()
         todos = emptyList()
+        rawBackgroundAgents = emptyList()
+        dismissedBackgroundAgents = emptySet()
+        backgroundAgents = emptyList()
         compactionCount = 0
         for (msg in history) {
             val item = Message(msg.info)
@@ -381,6 +428,9 @@ class SessionModel {
         state = SessionState.Idle
         diff = emptyList()
         todos = emptyList()
+        rawBackgroundAgents = emptyList()
+        dismissedBackgroundAgents = emptySet()
+        backgroundAgents = emptyList()
         compactionCount = 0
         fire(SessionModelEvent.Cleared)
         updateHeader()
@@ -510,6 +560,7 @@ class SessionModel {
                 existing.title = dto.title
                 existing.input = dto.input
                 existing.metadata = dto.metadata
+                existing.approval = dto.approval?.toModel()
                 existing.childSessionId = childID(existing)
                 if (old != null && old != existing.childSessionId) {
                     childRefs.remove(old)
@@ -566,6 +617,7 @@ class SessionModel {
                 title = dto.title
                 input = dto.input
                 metadata = dto.metadata
+                approval = dto.approval?.toModel()
                 childSessionId = childID(this)
                 output = dto.output
                 error = dto.error
@@ -928,6 +980,16 @@ private fun renderTool(tool: Tool): String {
     ).filterNotNull().joinToString("")
     return "tool#${tool.id} ${tool.name} [$state]$title$data"
 }
+
+private fun ToolApprovalDto.toModel() = ToolApproval(
+    source = source,
+    agent = agent,
+    rulePermission = rulePermission,
+    rulePattern = rulePattern,
+    ruleAction = ruleAction,
+    outsideWorkspace = outsideWorkspace,
+    outsideWorkspacePath = outsideWorkspacePath,
+)
 
 private fun renderMap(map: Map<String, String>): String =
     map.entries.sortedBy { it.key }.joinToString(",", "{", "}") { "${it.key}=${it.value}" }

@@ -1,4 +1,21 @@
-export type WorktreeErrorCode = "git_not_found" | "not_git_repo" | "lfs_missing"
+export type WorktreeErrorCode =
+  | "git_not_found"
+  | "not_git_repo"
+  | "lfs_missing"
+  | "no_commits"
+  | "worktree_missing"
+  | "worktree_unregistered"
+  | "git_timeout"
+
+export interface BaseUpdateRequest {
+  type: "agentManager.updateFromBase"
+  projectId?: string
+  worktreeId: string
+  sessionId?: string
+  model?: { providerID: string; modelID: string }
+  variant?: string
+  agent?: string
+}
 
 export interface TerminalFont {
   fontFamily: string
@@ -33,6 +50,8 @@ export interface WorktreeState {
   prState?: string
   /** Section this worktree belongs to, or undefined for ungrouped. */
   sectionId?: string
+  /** Pinned worktrees show at the top of the sidebar, above sections. */
+  pinned?: boolean
 }
 
 export interface SectionState {
@@ -55,6 +74,8 @@ import type {
   PRCheck,
   PRComment,
   PRReviewer,
+  PRTimelineItem,
+  PRMergeStatus,
 } from "../../../agent-manager/pr/pr-types"
 export type {
   PRState,
@@ -63,34 +84,21 @@ export type {
   AggregateCheckStatus,
   PRCheck,
   PRComment,
+  PRCommentReply,
   PRReviewer,
+  PRStatus,
+  PRConversationComment,
+  PRCommitItem,
+  PREventItem,
+  PREventKind,
+  PRTimelineItem,
+  PRReaction,
+  PRReactionContent,
+  PRMergeMethod,
+  PRMergeability,
+  PRMergeState,
+  PRMergeStatus,
 } from "../../../agent-manager/pr/pr-types"
-
-export interface PRStatus {
-  number: number
-  title: string
-  body?: string
-  url: string
-  state: PRState
-  review: ReviewDecision | null
-  checks: {
-    status: AggregateCheckStatus
-    total: number
-    passed: number
-    failed: number
-    pending: number
-    checks: PRCheck[]
-  }
-  reviewers: PRReviewer[]
-  comments?: {
-    total: number
-    unresolved: number
-    comments: PRComment[]
-  }
-  additions: number
-  deletions: number
-  files: number
-}
 
 export type RunState = "idle" | "running" | "stopping"
 
@@ -102,6 +110,17 @@ export interface RunStatus {
   startedAt?: string
   finishedAt?: string
   error?: string
+}
+
+export interface CaffeinationState {
+  enabled: boolean
+  active: boolean
+  available: boolean
+  error?: string
+}
+
+export interface AgentManagerCaffeinationMessage extends CaffeinationState {
+  type: "agentManager.caffeination"
 }
 
 export interface ManagedSessionState {
@@ -146,6 +165,7 @@ export interface WorktreeFileDiff {
   tracked?: boolean
   generatedLike?: boolean
   summarized?: boolean
+  failed?: boolean
   stamp?: string
   kind?: "image"
   image?: DiffImage
@@ -178,7 +198,11 @@ export interface LocalGitStats {
   behind: number
 }
 
-export type { ReviewCommentData as ReviewComment } from "../../../../src/shared/review-comments"
+export type {
+  ReviewCommentData as ReviewComment,
+  ReviewCommentEntry,
+  PRReviewCommentData,
+} from "../../../../src/shared/review-comments"
 
 /**
  * Maximum number of parallel worktree versions for multi-version mode.

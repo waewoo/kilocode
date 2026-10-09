@@ -1,6 +1,6 @@
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { describe, expect, test } from "bun:test"
-import { Effect, Layer, ManagedRuntime, Queue, Schema } from "effect"
+import { Cause, Effect, Exit, Layer, ManagedRuntime, Queue, Schema } from "effect"
 import { MessageID, SessionID } from "../../src/session/schema"
 import { provideTmpdirInstance } from "../fixture/fixture"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
@@ -151,6 +151,13 @@ function publish(
 }
 
 describe("agent_manager tool", () => {
+  test("tells models to start sessions only on explicit user intent", async () => {
+    const tool = await init()
+
+    expect(tool.description).toContain("Start sessions only when the user explicitly asks")
+    expect(tool.description).toContain("Never start them on your own")
+  })
+
   test("uses an object-root input schema without combinators because more complex schemas break Claude models", async () => {
     const tool = await init()
     const schema = ToolJsonSchema.fromTool(tool)
@@ -161,7 +168,7 @@ describe("agent_manager tool", () => {
     expect(schema.allOf).toBeUndefined()
     const action = schema.properties?.action
     expect(action && typeof action === "object" ? action.anyOf?.[0] : undefined).toEqual(
-      expect.objectContaining({ enum: ["list", "prompt", "stop", "move"] }),
+      expect.objectContaining({ enum: ["list", "prompt", "stop", "move", "answer"] }),
     )
     expect(action && typeof action === "object" ? action.description : undefined).toContain("Use list first")
     expect(action && typeof action === "object" ? action.description : undefined).toContain("Never edit")
@@ -181,11 +188,29 @@ describe("agent_manager tool", () => {
       "mode",
       "versions",
       "tasks",
+      "worktreeID",
       "action",
       "filter",
       "sessionID",
       "prompt",
+      "replyTo",
       "sectionID",
+      "questionID",
+      "answers",
+    ])
+    expect(schema.required).toEqual([
+      "mode",
+      "versions",
+      "tasks",
+      "worktreeID",
+      "action",
+      "filter",
+      "sessionID",
+      "prompt",
+      "replyTo",
+      "sectionID",
+      "questionID",
+      "answers",
     ])
   })
 
@@ -196,7 +221,20 @@ describe("agent_manager tool", () => {
     const tool = await init()
     const schema = ToolJsonSchema.fromTool(tool)
 
-    for (const key of ["mode", "versions", "tasks", "action", "filter", "sessionID", "prompt", "sectionID"]) {
+    for (const key of [
+      "mode",
+      "versions",
+      "tasks",
+      "worktreeID",
+      "action",
+      "filter",
+      "sessionID",
+      "prompt",
+      "replyTo",
+      "sectionID",
+      "questionID",
+      "answers",
+    ]) {
       const property = schema.properties?.[key]
       const branches = property && typeof property === "object" ? property.anyOf : undefined
       expect(
@@ -207,13 +245,131 @@ describe("agent_manager tool", () => {
     // The advertised bounds on tasks must survive being made nullable.
     const tasks = schema.properties?.tasks
     expect(typeof tasks === "object" ? tasks.anyOf?.[0] : undefined).toEqual(
-      expect.objectContaining({ minItems: 1, maxItems: 20 }),
+      expect.objectContaining({ type: "array", minItems: 1, maxItems: 20 }),
     )
+    expect(typeof tasks === "object" ? tasks.anyOf : undefined).toHaveLength(2)
+  })
+
+  test.each(["local", "worktree"])("decodes JSON-encoded tasks for %s sessions", (mode) => {
+    const tasks = [
+      { prompt: 'Check "quoted" text\nC:\\repo', name: "Encoded" },
+      { name: "Prepared", model: null },
+    ]
+    expect(Schema.decodeUnknownSync(Params)({ mode, tasks: JSON.stringify(tasks), action: null })).toEqual({
+      mode,
+      tasks,
+    })
+  })
+
+  test("rejects invalid JSON-encoded tasks before permission or event publication", async () => {
+    const tool: Tool.Def = await init()
+    const permissions: unknown[] = []
+    const events: AgentManagerStart[] = []
+    await runtime.runPromise(
+      provideTmpdirInstance(() =>
+        Effect.gen(function* () {
+          const bus = yield* Bus.Service
+          const off = yield* bus.subscribeCallback(AgentManagerEvent.Start, (item) => events.push(item.properties))
+          yield* Effect.addFinalizer(() => Effect.sync(off))
+          for (const tasks of [
+            "[",
+            "null",
+            "{}",
+            '"[]"',
+            "[]",
+            "[null]",
+            "[{}]",
+            JSON.stringify([{ prompt: 42 }]),
+            JSON.stringify([{ name: "Prepared", model: "test/reasoning/model" }]),
+            JSON.stringify(Array.from({ length: 21 }, () => ({ prompt: "Fix" }))),
+          ]) {
+            const result = yield* tool
+              .execute(
+                { mode: "local", tasks },
+                { ...ctx, ask: (input: unknown) => Effect.sync(() => permissions.push(input)) },
+              )
+              .pipe(Effect.exit)
+            expect(Exit.isFailure(result)).toBe(true)
+            if (Exit.isFailure(result)) expect(Cause.squash(result.cause)).toBeInstanceOf(Tool.InvalidArgumentsError)
+          }
+        }),
+      ).pipe(Effect.scoped),
+    )
+    expect(permissions).toEqual([])
+    expect(events).toEqual([])
+  })
+
+  test("validates worktree targeting before permission and forwards valid targets", async () => {
+    const tool: Tool.Def = await init()
+    const permissions: unknown[] = []
+    const events: AgentManagerStart[] = []
+    await runtime.runPromise(
+      provideTmpdirInstance(() =>
+        Effect.gen(function* () {
+          const bus = yield* Bus.Service
+          const queue = yield* Queue.unbounded<AgentManagerStart>()
+          const off = yield* bus.subscribeCallback(AgentManagerEvent.Start, (item) => {
+            events.push(item.properties)
+            Queue.offerUnsafe(queue, item.properties)
+          })
+          yield* Effect.addFinalizer(() => Effect.sync(off))
+          const context = { ...ctx, ask: (input: unknown) => Effect.sync(() => permissions.push(input)) }
+          for (const input of [
+            { worktreeID: "" },
+            { worktreeID: "  " },
+            { worktreeID: 42 },
+            { worktreeID: "wt-target", mode: "worktree" },
+            { worktreeID: "wt-target", versions: true },
+            { worktreeID: "wt-target", tasks: [{ prompt: "Fix", branchName: "" }] },
+            { worktreeID: "wt-target", tasks: JSON.stringify([{ prompt: "Fix", branchName: "branch" }]) },
+          ]) {
+            const result = yield* tool
+              .execute({ mode: "local", tasks: [{ prompt: "Fix" }], ...input }, context)
+              .pipe(Effect.exit)
+            expect(Exit.isFailure(result)).toBe(true)
+          }
+          expect(permissions).toEqual([])
+          expect(events).toEqual([])
+          for (const worktreeID of [undefined, null, "wt-target"]) {
+            const result = yield* tool.execute({ mode: "local", worktreeID, tasks: [{ name: "Prepared" }] }, context)
+            const event = yield* Queue.take(queue).pipe(Effect.timeout("2 seconds"))
+            expect(event.worktreeID).toBe(worktreeID ?? undefined)
+            if (worktreeID) {
+              expect(result.output).toContain("Existing managed worktree: wt-target")
+              expect(permissions.at(-1)).toMatchObject({ metadata: { worktreeID } })
+            }
+          }
+        }),
+      ).pipe(Effect.scoped),
+    )
+  })
+
+  // Some models send the string "null" (#14725). The error must tell them how to recover.
+  test("explains how to recover from a worktreeID in worktree mode", async () => {
+    const tool: Tool.Def = await init()
+    const result = await runtime.runPromise(
+      tool.execute({ mode: "worktree", worktreeID: "null", tasks: [{ name: "test" }] }, ctx).pipe(Effect.exit),
+    )
+    expect(Exit.isFailure(result)).toBe(true)
+    if (Exit.isFailure(result)) {
+      const err = Cause.squash(result.cause)
+      expect(err).toBeInstanceOf(Tool.InvalidArgumentsError)
+      expect(String((err as Error).message)).toContain('worktreeID "null" requires mode local')
+      expect(String((err as Error).message)).toContain("omit worktreeID or send JSON null")
+    }
   })
 
   test("keeps session ID validation local", () => {
     expect(Schema.is(Params)({ action: "stop", sessionID: "ses_target" })).toBe(true)
     expect(Schema.is(Params)({ action: "stop", sessionID: "invalid" })).toBe(false)
+  })
+
+  test("validates provider selectors at the task level", () => {
+    expect(Schema.is(Params)({ mode: "local", tasks: [{ prompt: "Fix", model: "Shared", provider: "kilo" }] })).toBe(
+      true,
+    )
+    expect(Schema.is(Params)({ mode: "local", tasks: [{ prompt: "Fix", provider: "kilo" }] })).toBe(false)
+    expect(Schema.is(Params)({ mode: "local", tasks: [{ prompt: "Fix", model: "Shared", provider: 42 }] })).toBe(false)
   })
 
   // Regression for #13029: the OpenAI Responses API forces a value for every
@@ -265,6 +421,90 @@ describe("agent_manager tool", () => {
       sessionID: "ses_target",
       prompt: "go",
     })
+    expect(
+      decode({ ...blanks, action: "prompt", sessionID: "ses_target", prompt: "done", replyTo: "amr_request" }),
+    ).toEqual({
+      action: "prompt",
+      sessionID: "ses_target",
+      prompt: "done",
+      replyTo: "amr_request",
+    })
+  })
+
+  test("routes a null-filled answer request to its action", () => {
+    const blanks = { mode: null, versions: null, tasks: null, filter: null, sectionID: null, prompt: null }
+    const decode = (input: unknown) => Schema.decodeUnknownSync(Params)(input) as Record<string, unknown>
+
+    expect(decode({ ...blanks, action: "answer", sessionID: "ses_target", answers: [["Yes"]] })).toEqual({
+      action: "answer",
+      sessionID: "ses_target",
+      answers: [["Yes"]],
+    })
+    expect(
+      decode({ ...blanks, action: "answer", sessionID: "ses_target", questionID: "que_1", answers: [["Yes"], []] }),
+    ).toEqual({
+      action: "answer",
+      sessionID: "ses_target",
+      questionID: "que_1",
+      answers: [["Yes"], []],
+    })
+  })
+
+  test("rejects an answer without answers or with an empty label array", () => {
+    const decode = (input: unknown) => Schema.decodeUnknownSync(Params)(input)
+    expect(() => decode({ action: "answer", sessionID: "ses_target" })).toThrow()
+    expect(() => decode({ action: "answer", sessionID: "ses_target", answers: [[""]] })).toThrow()
+    expect(() => decode({ action: "answer", sessionID: "ses_target", answers: [] })).toThrow()
+  })
+
+  test("answers one pending question with a separate mutation permission pattern", async () => {
+    const requests: unknown[] = []
+    const rt = makeRuntime("test", {
+      request: (input) =>
+        Effect.sync(() => {
+          requests.push(input)
+          return {
+            operation: "answer" as const,
+            sessionID: SessionID.make("ses_target"),
+            questionID: "que_1",
+            resolved: true as const,
+          }
+        }),
+    })
+    const tool = await rt.runPromise(
+      Effect.gen(function* () {
+        return yield* Tool.init(yield* AgentManagerTool)
+      }),
+    )
+    const permissions: unknown[] = []
+    const result = await rt.runPromise(
+      provideTmpdirInstance(() =>
+        tool.execute(
+          { action: "answer", sessionID: SessionID.make("ses_target"), answers: [["Yes"], ["detail"]] },
+          { ...ctx, ask: (input: unknown) => Effect.sync(() => permissions.push(input)) },
+        ),
+      ).pipe(Effect.scoped),
+    )
+
+    expect(permissions).toEqual([
+      {
+        permission: "agent_manager",
+        patterns: ["answer"],
+        always: ["answer"],
+        metadata: { action: "answer", sessionID: "ses_target" },
+      },
+    ])
+    expect(requests).toEqual([
+      {
+        operation: "answer",
+        sessionID: ctx.sessionID,
+        targetSessionID: "ses_target",
+        answers: [["Yes"], ["detail"]],
+      },
+    ])
+    expect(result.output).toContain("que_1")
+    expect(result.metadata).toEqual(expect.objectContaining({ action: "answer", sessionID: "ses_target" }))
+    await rt.dispose()
   })
 
   test("asks for agent_manager permission", async () => {
@@ -354,7 +594,12 @@ describe("agent_manager tool", () => {
     await rt.dispose()
   })
 
-  test("prompts one existing session with a separate mutation permission pattern", async () => {
+  test.each([
+    { name: "single-line", prompt: "Continue the fix" },
+    { name: "multiline", prompt: 'Review <script>alert("test")</script>.\n\n  Keep `code` and **markup** literal.' },
+    { name: "long", prompt: "Review the next file.\n".repeat(500) + "Report the final result." },
+  ])("previews the full $name prompt before sending it to one session", async (item) => {
+    const prompt = item.prompt
     const requests: unknown[] = []
     const rt = makeRuntime("test", {
       request: (input) =>
@@ -372,7 +617,71 @@ describe("agent_manager tool", () => {
     const result = await rt.runPromise(
       provideTmpdirInstance(() =>
         tool.execute(
-          { action: "prompt", sessionID: SessionID.make("ses_target"), prompt: "  Continue the fix  " },
+          { action: "prompt", sessionID: SessionID.make("ses_target"), prompt: `  ${prompt}\n ` },
+          {
+            ...ctx,
+            ask: (input: unknown) =>
+              Effect.sync(() => {
+                expect(requests).toEqual([])
+                permissions.push(input)
+              }),
+          },
+        ),
+      ).pipe(Effect.scoped),
+    )
+
+    expect(permissions).toEqual([
+      {
+        permission: "agent_manager",
+        patterns: ["prompt"],
+        always: ["prompt"],
+        metadata: {
+          action: "prompt",
+          sessionID: "ses_target",
+          description: `Send a prompt to Agent Manager session ses_target:\n\n${prompt}`,
+        },
+      },
+    ])
+    expect(requests).toEqual([
+      {
+        operation: "prompt",
+        sessionID: ctx.sessionID,
+        sourceSessionID: ctx.sessionID,
+        targetSessionID: "ses_target",
+        prompt,
+      },
+    ])
+    expect(result.title).toBe("Prompt accepted")
+    expect(result.output).toContain("queued behind active work")
+    expect(result.output).toContain("does not wait for completion")
+    expect(result.metadata).toEqual(expect.objectContaining({ action: "prompt", sessionID: "ses_target" }))
+    await rt.dispose()
+  })
+
+  test("forwards a peer reply reference to Agent Manager", async () => {
+    const requests: unknown[] = []
+    const rt = makeRuntime("test", {
+      request: (input) =>
+        Effect.sync(() => {
+          requests.push(input)
+          return { operation: "prompt" as const, sessionID: SessionID.make("ses_caller"), delivered: true as const }
+        }),
+    })
+    const tool = await rt.runPromise(
+      Effect.gen(function* () {
+        return yield* Tool.init(yield* AgentManagerTool)
+      }),
+    )
+    const permissions: unknown[] = []
+    const result = await rt.runPromise(
+      provideTmpdirInstance(() =>
+        tool.execute(
+          {
+            action: "prompt",
+            sessionID: SessionID.make("ses_caller"),
+            prompt: "The change is complete.",
+            replyTo: "amr_request",
+          },
           { ...ctx, ask: (input: unknown) => Effect.sync(() => permissions.push(input)) },
         ),
       ).pipe(Effect.scoped),
@@ -383,19 +692,29 @@ describe("agent_manager tool", () => {
         permission: "agent_manager",
         patterns: ["prompt"],
         always: ["prompt"],
-        metadata: { action: "prompt", sessionID: "ses_target" },
+        metadata: {
+          action: "prompt",
+          sessionID: "ses_caller",
+          replyTo: "amr_request",
+          description: expect.any(String),
+        },
       },
     ])
     expect(requests).toEqual([
       {
         operation: "prompt",
         sessionID: ctx.sessionID,
-        targetSessionID: "ses_target",
-        prompt: "Continue the fix",
+        sourceSessionID: ctx.sessionID,
+        targetSessionID: "ses_caller",
+        prompt: "The change is complete.",
+        replyTo: "amr_request",
       },
     ])
-    expect(result.output).toContain("accepted it asynchronously")
-    expect(result.metadata).toEqual(expect.objectContaining({ action: "prompt", sessionID: "ses_target" }))
+    expect(result.title).toBe("Reply accepted")
+    expect(result.output).toContain("does not wait for completion")
+    expect(result.metadata).toEqual(
+      expect.objectContaining({ action: "prompt", sessionID: "ses_caller", replyTo: "amr_request" }),
+    )
     await rt.dispose()
   })
 
@@ -535,6 +854,16 @@ describe("agent_manager tool", () => {
     expect(task?.variant).toBeUndefined()
   })
 
+  test("inherits the invoking variant when the model override resolves to the invoking model", async () => {
+    const task = await publish(runtime, { prompt: "Fix", model: "Shared" }, [
+      message("msg_current", "kilo", "kilo/shared", "low"),
+    ])
+
+    expect(String(task?.model?.providerID)).toBe("kilo")
+    expect(String(task?.model?.modelID)).toBe("kilo/shared")
+    expect(task?.variant).toBe("low")
+  })
+
   test("overrides only the inherited variant when model is omitted", async () => {
     const task = await publish(runtime, { prompt: "Fix", variant: "high" }, [
       message("msg_current", "test", "reasoning/model", "low"),
@@ -545,8 +874,9 @@ describe("agent_manager tool", () => {
     expect(task?.variant).toBe("high")
   })
 
-  test("publishes validated model and variant selections", async () => {
-    const tool = await init()
+  test.each(["array", "JSON-encoded"])("publishes validated selections from %s tasks", async (encoding) => {
+    const tool: Tool.Def = await init()
+    const tasks = [{ prompt: "Fix issue", model: "test/reasoning/model", variant: "high" }]
 
     const event = await runtime.runPromise(
       provideTmpdirInstance(() =>
@@ -561,7 +891,7 @@ describe("agent_manager tool", () => {
           yield* tool.execute(
             {
               mode: "local",
-              tasks: [{ prompt: "Fix issue", model: "test/reasoning/model", variant: "high" }],
+              tasks: encoding === "array" ? tasks : JSON.stringify(tasks),
             },
             { ...ctx, ask: () => Effect.void },
           )
@@ -582,6 +912,12 @@ describe("agent_manager tool", () => {
     expect(String(task?.model?.providerID)).toBe("test")
     expect(String(task?.model?.modelID)).toBe("test/shared")
     expect(task?.variant).toBe("low")
+  })
+
+  test("uses an explicitly selected provider for a shared model name", async () => {
+    const task = await publish(runtime, { prompt: "Fix", model: " Shared ", provider: " kilo " })
+    expect(String(task?.model?.providerID)).toBe("kilo")
+    expect(String(task?.model?.modelID)).toBe("kilo/shared")
   })
 
   test("uses the provider of a different default model when that is the user's choice", async () => {
@@ -625,6 +961,43 @@ describe("agent_manager tool", () => {
 
     expect(result.output).toContain("Closest matches:")
     expect(result.output).toContain("Reasoning Model")
+    expect(result.metadata.count).toBe(0)
+  })
+
+  test("reports a model unavailable from an explicit provider", async () => {
+    const tool = await init()
+    const calls: unknown[] = []
+
+    const result = await runtime.runPromise(
+      provideTmpdirInstance(() =>
+        tool.execute(
+          { mode: "local", tasks: [{ prompt: "Fix", model: "Reasoning Model", provider: "kilo" }] },
+          { ...ctx, ask: (input: unknown) => Effect.sync(() => calls.push(input)) },
+        ),
+      ).pipe(Effect.scoped),
+    )
+
+    expect(calls).toEqual([])
+    expect(result.output).toContain('model is not available from provider "kilo": Reasoning Model')
+    expect(result.metadata.count).toBe(0)
+  })
+
+  test("rejects an unknown provider without touching inherited object properties", async () => {
+    const tool = await init()
+    const calls: unknown[] = []
+
+    const result = await runtime.runPromise(
+      provideTmpdirInstance(() =>
+        tool.execute(
+          { mode: "local", tasks: [{ prompt: "Fix", model: "Shared", provider: "__proto__" }] },
+          { ...ctx, ask: (input: unknown) => Effect.sync(() => calls.push(input)) },
+        ),
+      ).pipe(Effect.scoped),
+    )
+
+    expect(calls).toEqual([])
+    expect(result.output).toContain("provider is not available for model selection: __proto__")
+    expect(result.output).toContain("Requested model: Shared")
     expect(result.metadata.count).toBe(0)
   })
 

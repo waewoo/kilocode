@@ -13,31 +13,15 @@
 import { createMemo, createSignal, type Accessor } from "solid-js"
 import type { DiffSourceDescriptor } from "../../src/diff/sources/types"
 
-export type DiffScope = "branch" | "staged" | "unstaged" | "session"
+import { composeDiffId, DEFAULT_DIFF_SCOPE, type DiffScope } from "../../src/agent-manager/diff-scope"
 
-export const DEFAULT_DIFF_SCOPE: DiffScope = "branch"
-
-const SEP = "#"
-const SESSION_TOKEN = "session:"
-
-export function composeDiffId(ctx: string, scope: DiffScope, sessionId?: string): string {
-  if (scope === "session" && sessionId) return `${ctx}${SEP}${SESSION_TOKEN}${sessionId}`
-  return `${ctx}${SEP}${scope}`
-}
-
-export function parseDiffId(id: string): { ctx: string; scope: DiffScope; sessionId?: string } {
-  const idx = id.lastIndexOf(SEP)
-  if (idx === -1) return { ctx: id, scope: DEFAULT_DIFF_SCOPE }
-  const token = id.slice(idx + SEP.length)
-  const ctx = id.slice(0, idx)
-  if (token.startsWith(SESSION_TOKEN)) return { ctx, scope: "session", sessionId: token.slice(SESSION_TOKEN.length) }
-  if (isDiffScope(token)) return { ctx, scope: token }
-  return { ctx: id, scope: DEFAULT_DIFF_SCOPE }
-}
-
-export function isDiffScope(value: string): value is DiffScope {
-  return value === "branch" || value === "staged" || value === "unstaged" || value === "session"
-}
+export {
+  composeDiffId,
+  parseDiffId,
+  isDiffScope,
+  DEFAULT_DIFF_SCOPE,
+  type DiffScope,
+} from "../../src/agent-manager/diff-scope"
 
 /**
  * The fixed scope descriptors for a context. `workspace` maps to the Branch
@@ -82,22 +66,22 @@ export function scopeCapabilities(scope: DiffScope): { revert: boolean; comments
 }
 
 /**
- * Per-context scope selection. Keeps the last-picked scope per context id so
+ * Per-context scope selection. Keeps the last-picked scope per namespaced key so
  * switching between worktrees restores each worktree's scope, while a brand
- * new context defaults to Branch. The context is the sidebar selection, so the
+ * new context defaults to Branch. The key includes the project and selection, so the
  * picked scope survives session tab switches inside the context.
  */
-export function createDiffScope(currentCtx: Accessor<string | undefined>) {
+export function createDiffScope(key: Accessor<string | undefined>) {
   const [scopes, setScopes] = createSignal<Record<string, DiffScope>>({})
 
   const scope = createMemo((): DiffScope => {
-    const ctx = currentCtx()
+    const ctx = key()
     if (!ctx) return DEFAULT_DIFF_SCOPE
     return scopes()[ctx] ?? DEFAULT_DIFF_SCOPE
   })
 
   const setScope = (next: DiffScope) => {
-    const ctx = currentCtx()
+    const ctx = key()
     if (!ctx) return
     setScopes((prev) => ({ ...prev, [ctx]: next }))
   }

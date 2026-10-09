@@ -18,6 +18,8 @@ interface VsCode {
 export interface DiffReviewScopeOptions {
   /** Current diff context (worktree id or the LOCAL pseudo-id). */
   ctx: Accessor<string | undefined>
+  /** Project-namespaced memory key, separate from the protocol context. */
+  key: Accessor<string | undefined>
   /** Active session inside the context; the Session scope follows it. */
   session: Accessor<string | undefined>
   /** Whether the diff side panel is open. */
@@ -25,10 +27,11 @@ export interface DiffReviewScopeOptions {
   /** Whether the full-screen review tab is active. */
   reviewActive: Accessor<boolean>
   vscode: VsCode
+  project: Accessor<string | undefined>
 }
 
 export function createDiffReviewScope(opts: DiffReviewScopeOptions) {
-  const scope = createDiffScope(opts.ctx)
+  const scope = createDiffScope(opts.key)
   // The composite id (ctx#scope, or ctx#session:<sid>) the extension keys
   // diff data by. Rebuilds when the active session changes while the Session
   // scope is active, so a session tab switch refetches that session's diff.
@@ -82,7 +85,13 @@ export function createDiffReviewScope(opts: DiffReviewScopeOptions) {
     // Optimistic update; the extension echoes authoritative state back.
     setCurrentBase(branch ?? autoBase())
     setIsAuto(branch === undefined)
-    opts.vscode.postMessage({ type: "agentManager.setDiffBaseBranch", sessionId: ctx, scope: scope.scope(), branch })
+    opts.vscode.postMessage({
+      type: "agentManager.setDiffBaseBranch",
+      projectId: opts.project(),
+      sessionId: ctx,
+      scope: scope.scope(),
+      branch,
+    })
   }
 
   // Fetch branch picker data whenever the Branch scope becomes active for the
@@ -93,7 +102,12 @@ export function createDiffReviewScope(opts: DiffReviewScopeOptions) {
     if (!ctx) return
     if (!opts.panelOpen() && !opts.reviewActive()) return
     setLoading(true)
-    opts.vscode.postMessage({ type: "agentManager.requestDiffBranches", sessionId: ctx, scope: scope.scope() })
+    opts.vscode.postMessage({
+      type: "agentManager.requestDiffBranches",
+      projectId: opts.project(),
+      sessionId: ctx,
+      scope: scope.scope(),
+    })
   })
 
   /** Handle the extension's diffBranches push, ignoring stale contexts. */
@@ -132,5 +146,19 @@ export function createDiffReviewScope(opts: DiffReviewScopeOptions) {
     currentBase,
     isAuto,
     currentBranch,
+    controls: () => ({
+      descriptors: descriptors(),
+      currentId: id(),
+      onSelectScope: select,
+      showBase: isBranch(),
+      branches: branches(),
+      branchesLoading: loading(),
+      defaultBranch: defaultBranch(),
+      autoBase: autoBase(),
+      currentBase: currentBase(),
+      isAuto: isAuto(),
+      currentBranch: currentBranch(),
+      onSelectBase: selectBase,
+    }),
   }
 }

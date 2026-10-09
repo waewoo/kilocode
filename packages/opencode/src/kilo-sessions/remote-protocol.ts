@@ -6,6 +6,10 @@ export namespace RemoteProtocol {
   export const SessionInfo = z.object({
     id: z.string(),
     status: z.string(),
+    // scheduled wakeups: the ISO-8601 time the session is due to wake. Present
+    // only with status "scheduled". Optional so legacy CLIs (no field) remain
+    // wire-compatible.
+    scheduledAt: z.string().optional(),
     title: z.string(),
     parentSessionId: z.string().optional(),
     gitUrl: z.string().optional(),
@@ -15,15 +19,20 @@ export namespace RemoteProtocol {
     //   KiloSession.resolvePlatform(id) || process.env["KILO_PLATFORM"] || "cli"
     // Optional so legacy CLIs (no field) remain wire-compatible.
     platform: z.string().max(32).optional(),
-    // kilocode_change - PR link: the pull request linked to the worktree this
-    // session is advertised from. Optional so legacy CLIs (no field) remain
-    // wire-compatible. `platform` here is the PR host (e.g. "github"), distinct
-    // from the session's `platform` (client OS) above.
+    // kilocode_change - PR link: the pull request this session owns on hard
+    // evidence (it created the PR or pushed its head branch). Optional so legacy
+    // CLIs (no field) remain wire-compatible. `platform` here is the PR host
+    // (e.g. "github"), distinct from the session's `platform` (client OS) above.
+    // `headRef`/`headSha` are the branch and commit the session pushed and travel
+    // with every link (the shared evidence contract); optional so older backends
+    // and CLIs stay wire-compatible.
     prLink: z
       .object({
         platform: z.string().min(1).max(32),
         prUrl: z.string().max(2048),
         prNumber: z.number().int().positive(),
+        headRef: z.string().max(2048).optional(),
+        headSha: z.string().max(64).optional(),
       })
       .optional(),
   })
@@ -37,6 +46,12 @@ export namespace RemoteProtocol {
     name: z.string().min(1).max(64), // os.hostname(), truncated
     projectName: z.string().min(1).max(64), // basename(Instance.directory), truncated
     version: z.string().max(32).optional(), // InstallationVersion, truncated
+    // Older CLIs advertise only name, projectName, and optional version.
+    // Keep metadata optional until those CLI versions and retained relay
+    // attachments are confirmed retired.
+    kind: z.enum(["cli", "remote"]).optional(),
+    startedAt: z.iso.datetime({ precision: 3 }).length(24).optional(),
+    gitBranch: z.string().max(24).optional(),
   })
   export type InstanceAdvertisement = z.infer<typeof InstanceAdvertisement>
 
@@ -48,6 +63,11 @@ export namespace RemoteProtocol {
   export const Capabilities = z
     .object({
       attachments: z.boolean().optional(),
+      // kilocode_change - sessionClone: present only when the CLI accepts a
+      // cloud-session clone (create_session.cloneFromKiloSessionId). The old
+      // wire form omits sessionClone; remove the mobile fail-closed check
+      // when every shipped CLI advertises it.
+      sessionClone: z.boolean().optional(),
     })
     .optional()
   export const Heartbeat = z.object({
